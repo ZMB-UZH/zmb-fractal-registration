@@ -1,0 +1,19 @@
+# Do not edit - changes here will be overwritten by Copier
+_commit: v0.6.6
+_src_path: gh:fractal-analytics-platform/fractal-tasks-template
+author_email: st.flurin@gmail.com
+author_name: Flurin Sturzenegger
+include_feature_task: false
+include_image_processing_task: false
+include_segmentation_task: true
+mode: customize
+package_name: zmb_fractal_registration
+project_license: BSD-3-Clause
+project_name: zmb-fractal-registration
+project_short_description: Fractal tasks for stitching and registration of OME-Zarr
+    images.
+project_url: ''
+run_git_init: false
+run_pixi_init_task: false
+segmentation_task: Threshold Segmentation
+
