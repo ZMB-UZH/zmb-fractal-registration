@@ -186,7 +186,7 @@ def stitch_and_register_init(
                 "reference_acquisition_index": acquisition_ids_filtered.index(
                     reference_acquisition.acquisition_ID
                 ),
-                "reference_channel": reference_channel,
+                "reference_channel": reference_channel.model_dump(),
                 "pyramid_level": pyramid_level,
                 "z_project": z_project,
                 "keep_original_acquisitions": keep_original_acquisitions,
