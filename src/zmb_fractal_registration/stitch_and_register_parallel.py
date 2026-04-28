@@ -40,6 +40,8 @@ from ngio.ome_zarr_meta import Channel
 from ngio.tables import RoiTable
 from pydantic import BaseModel, validate_call
 
+logger = logging.getLogger(__name__)
+
 
 class InitArgsStitchAndRegisterParallel(BaseModel):
     """Init Args for stitch_and_register_parallel task.
@@ -181,6 +183,13 @@ def stitch_and_register_parallel(
         zarr_url: Absolute path to the new OME-Zarr image.
         init_args: Initialization arguments from the init task.
     """
+    logger.info(
+        f"Starting stitch_and_register_parallel for zarr_url={zarr_url} with "
+        f"{len(init_args.zarr_urls_to_register)} acquisitions "
+        f"(reference index: {init_args.reference_acquisition_index}, "
+        f"pyramid_level: {init_args.pyramid_level}, z_project: {init_args.z_project})"
+    )
+
     if len(init_args.zarr_urls_to_register) < 2:
         raise ValueError("At least two acquisitions are required for registration.")
 
@@ -190,6 +199,7 @@ def stitch_and_register_parallel(
     if not (0 <= init_args.reference_acquisition_index < len(init_args.cycle_names)):
         raise ValueError("reference_acquisition_index is out of range.")
 
+    logger.info(f"Opening OME-Zarr containers for cycles: {init_args.cycle_names}")
     containers = {
         cycle: open_ome_zarr_container(url)
         for cycle, url in zip(
@@ -198,17 +208,23 @@ def stitch_and_register_parallel(
     }
     cycles = list(init_args.cycle_names)
     ref_cycle = cycles[init_args.reference_acquisition_index]
+    logger.info(f"Reference cycle: {ref_cycle} (registration channel: resolved below)")
 
     reg_image_ref = containers[ref_cycle].get_image(path=str(init_args.pyramid_level))
     reg_channel = _resolve_registration_channel(
         reg_image_ref, init_args.reference_channel
     )
+    logger.info(f"Resolved registration channel: '{reg_channel}'")
     z_project = init_args.z_project
 
     # ------------------------------------------------------------------
     # Step 1: Load all FOVs from each cycle at the registration pyramid
     # level, optionally projecting along z.
     # ------------------------------------------------------------------
+    logger.info(
+        f"Step 1: Loading FOVs at pyramid level {init_args.pyramid_level}"
+        f"{' (z-projected)' if z_project else ''}"
+    )
     msims_reg = {}
     for cycle in cycles:
         fov_roi_table = containers[cycle].get_table("FOV_ROI_table")
@@ -218,11 +234,16 @@ def stitch_and_register_parallel(
             fov_roi_table=fov_roi_table,
             z_project=z_project,
         )
+        logger.info(f"  Cycle '{cycle}': loaded {len(msims_reg[cycle])} FOV(s)")
 
     # ------------------------------------------------------------------
     # Step 2: Stitch the reference cycle - align its tiles relative to
     # each other using the stage positions as the starting point.
     # ------------------------------------------------------------------
+    logger.info(
+        f"Step 2: Stitching reference cycle '{ref_cycle}' "
+        f"({len(msims_reg[ref_cycle])} tiles)"
+    )
     registration.register(
         msims_reg[ref_cycle],
         reg_channel=reg_channel,
@@ -231,6 +252,9 @@ def stitch_and_register_parallel(
         pre_registration_pruning_method="keep_axis_aligned",
     )
 
+    logger.info(
+        "  Reference cycle stitching complete. Fusing reference tiles (lazy)..."
+    )
     # Fuse the stitched reference tiles into a single reference image (lazily and at the
     # sub-resolution). This is then used as the fixed target for registering the tiles
     # of the other cycles.
@@ -258,10 +282,18 @@ def stitch_and_register_parallel(
     # the fused reference image. Tiles across all cycles are registered
     # in parallel using dask.
     # ------------------------------------------------------------------
+    logger.info(
+        f"Step 3: Registering {len(cycles) - 1} non-reference cycle(s) "
+        f"against fused reference."
+    )
     delayed_tasks = []
     for cycle in cycles:
         if cycle == ref_cycle:
             continue
+        logger.debug(
+            f"  Queuing {len(msims_reg[cycle])} tile registration task(s) "
+            f"for cycle '{cycle}'"
+        )
         for msim in msims_reg[cycle]:
             task = delayed(registration.register)(
                 [msi_utils.get_msim_from_sim(sim_fused_ref_ds), msim],
@@ -273,13 +305,20 @@ def stitch_and_register_parallel(
                 reg_res_level=0,
             )
             delayed_tasks.append(task)
+    logger.info(
+        f"  Running {len(delayed_tasks)} tile registration task(s) in parallel..."
+    )
     compute(*delayed_tasks)
+    logger.info("  Parallel tile registration complete.")
 
     # ------------------------------------------------------------------
     # Step 4: Reload FOVs at full resolution and transfer the computed
     # transforms. When z_project was used, expand the 2D affine back to
     # 3D (identity in z) before applying it to the full volume.
     # ------------------------------------------------------------------
+    logger.info(
+        "Step 4: Reloading FOVs at full resolution and transferring transforms."
+    )
     msims_fusion = {}
     for cycle in cycles:
         fov_roi_table = containers[cycle].get_table("FOV_ROI_table")
@@ -311,6 +350,7 @@ def stitch_and_register_parallel(
     # Step 5: Determine the bounding box that contains all transformed
     # tiles across all cycles, then fuse each cycle into that canvas.
     # ------------------------------------------------------------------
+    logger.info("Step 5: Computing global bounding box and fusing all cycles.")
     origins_all = []
     antipodes_all = []
     for cycle in cycles:
@@ -335,8 +375,11 @@ def stitch_and_register_parallel(
             np.ceil((global_antipode - global_origin[dim]) / spacing_ref[dim])
         )
 
+    rounded_origin = {k: round(v, 3) for k, v in global_origin.items()}
+    logger.info(f"  Global output shape: {global_shape}, origin: {rounded_origin}")
     sims_fused = {}
     for cycle in cycles:
+        logger.info(f"  Fusing cycle '{cycle}'...")
         sims_fused[cycle] = fusion.fuse(
             [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]],
             transform_key="affine_registered",
@@ -356,6 +399,10 @@ def stitch_and_register_parallel(
     # ------------------------------------------------------------------
     # Step 6: Write the fused image to the output OME-Zarr store.
     # ------------------------------------------------------------------
+    logger.info(
+        f"Step 6: Writing fused image to '{zarr_url}' "
+        f"(shape: {sim_fused_all.shape}, dims: {sim_fused_all.dims})."
+    )
     # Build per-channel metadata, appending _{cycle} to each label so
     # channels from different cycles can be distinguished.
     channels_meta_all = []
@@ -379,6 +426,7 @@ def stitch_and_register_parallel(
     out_image = output_container.get_image()
     out_image.set_array(patch=sim_fused_all.data, axes_order=sim_fused_all.dims)
     out_image.consolidate()
+    logger.info("  Output image written and consolidated successfully.")
 
     image_list_updates = [
         {
@@ -388,13 +436,17 @@ def stitch_and_register_parallel(
     ]
 
     if init_args.keep_original_acquisitions:
-        logging.info("Keeping original acquisitions.")
+        logger.info("Keeping original acquisitions. Task complete.")
         return {"image_list_updates": image_list_updates}
 
     # Remove the original per-cycle acquisitions from disk.
+    logger.info(
+        f"Removing {len(init_args.zarr_urls_to_register)} original acquisition(s)..."
+    )
     for url in init_args.zarr_urls_to_register:
-        logging.info(f"Deleting original acquisition at {url}")
+        logger.info(f"  Deleting original acquisition at '{url}'")
         shutil.rmtree(url)
+    logger.info("Task complete.")
 
     return {
         "image_list_updates": image_list_updates,
