@@ -98,6 +98,29 @@
             ],
             "title": "ChannelSelectionModel",
             "type": "object"
+          },
+          "OutlierFilterModel": {
+            "description": "Settings for outlier filtering.",
+            "properties": {
+              "mode": {
+                "default": "disabled",
+                "description": "Outlier filter mode.\n\"disabled\": No filtering applied.\n\"absolute\": Filter by absolute shift threshold in \u00b5m.\n\"zscore\": Filter by z-score threshold (shift-average_shift/standard_deviation).\n    A value of 2-3 is typical.",
+                "enum": [
+                  "disabled",
+                  "absolute",
+                  "zscore"
+                ],
+                "title": "Mode",
+                "type": "string"
+              },
+              "threshold": {
+                "description": "Either absolute shift threshold in \u00b5m or z-score threshold. Tiles with shifts\nabove the threshold will be filtered out and their transformations will be replaced\nby the mean of the non-outlier shifts. Must be set if mode is not \"disabled\".",
+                "title": "Threshold",
+                "type": "number"
+              }
+            },
+            "title": "OutlierFilterModel",
+            "type": "object"
           }
         },
         "additionalProperties": false,
@@ -153,6 +176,15 @@
             "title": "Z Project",
             "type": "boolean",
             "description": "If True, calculate stitching/registration on a z-projection and apply the calculated transformations to the full 3D image. If False, operate on the full image volume. Only used in case of 3D images."
+          },
+          "outlier_filter": {
+            "$ref": "#/$defs/OutlierFilterModel",
+            "default": {
+              "mode": "disabled",
+              "threshold": null
+            },
+            "title": "Outlier Filter",
+            "description": "Settings for filtering out large shifts during registration."
           },
           "keep_original_acquisitions": {
             "default": true,
@@ -235,6 +267,14 @@
                 "default": true,
                 "title": "Keep Original Acquisitions",
                 "type": "boolean"
+              },
+              "outlier_filter": {
+                "$ref": "#/$defs/OutlierFilterModel",
+                "default": {
+                  "mode": "disabled",
+                  "threshold": null
+                },
+                "title": "Outlier_Filter"
               }
             },
             "required": [
@@ -244,6 +284,29 @@
               "reference_channel"
             ],
             "title": "InitArgsStitchAndRegisterParallel",
+            "type": "object"
+          },
+          "OutlierFilterModel": {
+            "description": "Settings for outlier filtering.",
+            "properties": {
+              "mode": {
+                "default": "disabled",
+                "description": "Outlier filter mode.\n\"disabled\": No filtering applied.\n\"absolute\": Filter by absolute shift threshold in \u00b5m.\n\"zscore\": Filter by z-score threshold (shift-average_shift/standard_deviation).\n    A value of 2-3 is typical.",
+                "enum": [
+                  "disabled",
+                  "absolute",
+                  "zscore"
+                ],
+                "title": "Mode",
+                "type": "string"
+              },
+              "threshold": {
+                "description": "Either absolute shift threshold in \u00b5m or z-score threshold. Tiles with shifts\nabove the threshold will be filtered out and their transformations will be replaced\nby the mean of the non-outlier shifts. Must be set if mode is not \"disabled\".",
+                "title": "Threshold",
+                "type": "number"
+              }
+            },
+            "title": "OutlierFilterModel",
             "type": "object"
           }
         },

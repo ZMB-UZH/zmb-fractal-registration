@@ -2,10 +2,31 @@
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from ngio import ChannelSelectionModel, open_ome_zarr_plate
 from pydantic import BaseModel, model_validator, validate_call
+
+
+class OutlierFilterModel(BaseModel):
+    """Settings for outlier filtering."""
+
+    mode: Literal["disabled", "absolute", "zscore"] = "disabled"
+    """Outlier filter mode.
+    "disabled": No filtering applied.
+    "absolute": Filter by absolute shift threshold in µm.
+    "zscore": Filter by z-score threshold (shift-average_shift/standard_deviation).
+        A value of 2-3 is typical."""
+    threshold: float | None = None
+    """Either absolute shift threshold in µm or z-score threshold. Tiles with shifts
+    above the threshold will be filtered out and their transformations will be replaced
+    by the mean of the non-outlier shifts. Must be set if mode is not "disabled"."""
+
+    @model_validator(mode="after")
+    def _check_threshold(self) -> "OutlierFilterModel":
+        if self.mode != "disabled" and self.threshold is None:
+            raise ValueError(f"`threshold` must be set when mode is '{self.mode}'.")
+        return self
 
 
 class AcquisitionInputModel(BaseModel):
@@ -52,6 +73,7 @@ def stitch_and_register_init(
     ),
     pyramid_level: int = 0,
     z_project: bool = True,
+    outlier_filter: OutlierFilterModel = OutlierFilterModel(),
     keep_original_acquisitions: bool = True,
 ):
     """Stitch and register multiple acquisitions of a plate.
@@ -82,6 +104,8 @@ def stitch_and_register_init(
             and apply the calculated transformations to the full 3D image.
             If False, operate on the full image volume. Only used in case of
             3D images.
+        outlier_filter: Settings for filtering out large shifts during
+            registration.
         keep_original_acquisitions: If True, keep original acquisitions after
             registration. If False, remove them.
     """
@@ -190,6 +214,7 @@ def stitch_and_register_init(
                 "pyramid_level": pyramid_level,
                 "z_project": z_project,
                 "keep_original_acquisitions": keep_original_acquisitions,
+                "outlier_filter": outlier_filter.model_dump(),
             }
             parallelization_list.append(
                 {

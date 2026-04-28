@@ -40,6 +40,10 @@ from ngio.ome_zarr_meta import Channel
 from ngio.tables import RoiTable
 from pydantic import BaseModel, validate_call
 
+from zmb_fractal_registration.stitch_and_register_init import (
+    OutlierFilterModel,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +64,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
             If False, operate on the full image volume.
         keep_original_acquisitions: If True, keep the original acquisitions.
             If False, remove them after processing.
+        outlier_filter: Settings for outlier registration-shift correction.
     """
 
     zarr_urls_to_register: list[str]
@@ -69,6 +74,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
     pyramid_level: int = 0
     z_project: bool = True
     keep_original_acquisitions: bool = True
+    outlier_filter: OutlierFilterModel = OutlierFilterModel()
 
 
 def _get_original_translation(roi: Roi, spatial_dims: list[str]) -> dict[str, float]:
@@ -161,6 +167,22 @@ def _get_antipode_of_sim(sim, transform_key: str | None = None) -> dict[str, flo
     return dict(zip(get_spatial_dims_from_sim(sim), antipode, strict=True))
 
 
+def _get_affine_translation(affine: xr.DataArray) -> np.ndarray:
+    """Extract the translation vector from a homogeneous affine DataArray.
+
+    Returns a 1-D numpy array of length ndim with the translation components
+    (last column of the affine matrix, excluding the homogeneous row).
+    """
+    sel_dict = {
+        dim: affine.coords[dim][0].values
+        for dim in affine.dims
+        if dim not in ["x_in", "x_out"]
+    }
+    a = np.array(affine.sel(sel_dict))
+    ndim = a.shape[0] - 1
+    return a[:ndim, ndim]
+
+
 def _resolve_registration_channel(image, selector: ChannelSelectionModel) -> str:
     """Resolve a ChannelSelectionModel to a channel label for registration."""
     if selector.mode == "index":
@@ -218,11 +240,11 @@ def stitch_and_register_parallel(
     z_project = init_args.z_project
 
     # ------------------------------------------------------------------
-    # Step 1: Load all FOVs from each cycle at the registration pyramid
+    # Load all FOVs from each cycle at the registration pyramid
     # level, optionally projecting along z.
     # ------------------------------------------------------------------
     logger.info(
-        f"Step 1: Loading FOVs at pyramid level {init_args.pyramid_level}"
+        f"Loading FOVs at pyramid level {init_args.pyramid_level}"
         f"{' (z-projected)' if z_project else ''}"
     )
     msims_reg = {}
@@ -237,12 +259,11 @@ def stitch_and_register_parallel(
         logger.info(f"  Cycle '{cycle}': loaded {len(msims_reg[cycle])} FOV(s)")
 
     # ------------------------------------------------------------------
-    # Step 2: Stitch the reference cycle - align its tiles relative to
+    # Stitch the reference cycle - align its tiles relative to
     # each other using the stage positions as the starting point.
     # ------------------------------------------------------------------
     logger.info(
-        f"Step 2: Stitching reference cycle '{ref_cycle}' "
-        f"({len(msims_reg[ref_cycle])} tiles)"
+        f"Stitching reference cycle '{ref_cycle}' ({len(msims_reg[ref_cycle])} tiles)"
     )
     registration.register(
         msims_reg[ref_cycle],
@@ -278,13 +299,12 @@ def stitch_and_register_parallel(
     sim_fused_ref_ds = xr.where(sim_fused_ref_ds_mask > 0, sim_fused_ref_ds, np.nan)
 
     # ------------------------------------------------------------------
-    # Step 3: Register each non-reference cycle tile individually against
+    # Register each non-reference cycle tile individually against
     # the fused reference image. Tiles across all cycles are registered
     # in parallel using dask.
     # ------------------------------------------------------------------
     logger.info(
-        f"Step 3: Registering {len(cycles) - 1} non-reference cycle(s) "
-        f"against fused reference."
+        f"Registering {len(cycles) - 1} non-reference cycle(s) against fused reference."
     )
     delayed_tasks = []
     for cycle in cycles:
@@ -312,13 +332,113 @@ def stitch_and_register_parallel(
     logger.info("  Parallel tile registration complete.")
 
     # ------------------------------------------------------------------
-    # Step 4: Reload FOVs at full resolution and transfer the computed
+    # Outlier shift correction - for each non-reference cycle, compute the
+    # mean registration shift (affine_registered minus fractal_input
+    # translation) across all its tiles. Any tile whose shift has a
+    # z-score (standardised distance from the per-cycle mean) above
+    # `outlier_filter.threshold`, or whose absolute distance from the mean
+    # exceeds `outlier_filter.threshold` µm, is reset to the inlier mean
+    # shift.
+    # ------------------------------------------------------------------
+    osc = init_args.outlier_filter
+    if osc.mode != "disabled":
+        if osc.mode == "zscore":
+            logger.info(
+                f"Outlier shift correction (z-score threshold: {osc.threshold})."
+            )
+        else:
+            logger.info(
+                f"Outlier shift correction (absolute threshold: {osc.threshold} µm)."
+            )
+        for cycle in cycles:
+            if cycle == ref_cycle:
+                continue
+            shifts = []
+            for msim in msims_reg[cycle]:
+                sim = msi_utils.get_sim_from_msim(msim)
+                t_reg = _get_affine_translation(
+                    get_affine_from_sim(sim, transform_key="affine_registered")
+                )
+                t_in = _get_affine_translation(
+                    get_affine_from_sim(sim, transform_key="fractal_input")
+                )
+                shifts.append(t_reg - t_in)
+
+            # Euclidean distance of each tile's shift from the all-tile mean.
+            initial_mean = np.mean(shifts, axis=0)
+            deviations = np.array(
+                [float(np.linalg.norm(s - initial_mean)) for s in shifts]
+            )
+
+            # Determine per-tile outlier flag.
+            if osc.mode == "zscore":
+                mean_dev = float(np.mean(deviations))
+                std_dev = float(np.std(deviations))
+                if std_dev > 0:
+                    zscores = (deviations - mean_dev) / std_dev
+                else:
+                    zscores = np.zeros_like(deviations)
+                is_outlier = zscores > osc.threshold
+                score_label = "z-score"
+                scores = zscores
+            else:
+                is_outlier = deviations > osc.threshold
+                score_label = "deviation (µm)"
+                scores = deviations
+
+            inlier_shifts = [
+                s for s, bad in zip(shifts, is_outlier, strict=True) if not bad
+            ]
+
+            if inlier_shifts:
+                mean_shift = np.mean(inlier_shifts, axis=0)
+            else:
+                logger.warning(
+                    f"  Cycle '{cycle}': all tiles flagged as outliers; "
+                    f"falling back to full-tile mean."
+                )
+                mean_shift = initial_mean
+
+            logger.info(
+                f"  Cycle '{cycle}': inlier mean shift (µm) = "
+                f"{np.round(mean_shift, 3)} "
+                f"({len(inlier_shifts)}/{len(shifts)} inlier tiles)"
+            )
+
+            for i, (msim, shift, score, bad) in enumerate(
+                zip(msims_reg[cycle], shifts, scores, is_outlier, strict=True)
+            ):
+                if bad:
+                    logger.warning(
+                        f"  Cycle '{cycle}', tile {i}: shift "
+                        f"{np.round(shift, 3)} ({score_label}={score:.2f}) "
+                        f"flagged as outlier. Replacing with inlier mean "
+                        f"{np.round(mean_shift, 3)}."
+                    )
+                    sim = msi_utils.get_sim_from_msim(msim)
+                    affine_in = get_affine_from_sim(sim, transform_key="fractal_input")
+                    # Use numpy modification (consistent with
+                    # _get_affine_translation) to avoid relying on
+                    # the string coord labels of x_in / x_out.
+                    sel_dict_af = {
+                        dim: affine_in.coords[dim][0].values
+                        for dim in affine_in.dims
+                        if dim not in ["x_in", "x_out"]
+                    }
+                    a = np.array(affine_in.sel(sel_dict_af))
+                    a[: len(mean_shift), -1] += mean_shift
+                    affine_corrected = affine_in.copy(deep=True)
+                    affine_corrected.loc[sel_dict_af] = a
+                    msi_utils.set_affine_transform(
+                        msim, affine_corrected, "affine_registered"
+                    )
+
+    # ------------------------------------------------------------------
+    # Reload FOVs at full resolution and transfer the computed
     # transforms. When z_project was used, expand the 2D affine back to
     # 3D (identity in z) before applying it to the full volume.
     # ------------------------------------------------------------------
-    logger.info(
-        "Step 4: Reloading FOVs at full resolution and transferring transforms."
-    )
+    logger.info("Reloading FOVs at full resolution and transferring transforms.")
     msims_fusion = {}
     for cycle in cycles:
         fov_roi_table = containers[cycle].get_table("FOV_ROI_table")
@@ -347,10 +467,10 @@ def stitch_and_register_parallel(
             msi_utils.set_affine_transform(msim_fus, affine, "affine_registered")
 
     # ------------------------------------------------------------------
-    # Step 5: Determine the bounding box that contains all transformed
+    # Determine the bounding box that contains all transformed
     # tiles across all cycles, then fuse each cycle into that canvas.
     # ------------------------------------------------------------------
-    logger.info("Step 5: Computing global bounding box and fusing all cycles.")
+    logger.info("Computing global bounding box and fusing all cycles.")
     origins_all = []
     antipodes_all = []
     for cycle in cycles:
@@ -397,10 +517,10 @@ def stitch_and_register_parallel(
     )
 
     # ------------------------------------------------------------------
-    # Step 6: Write the fused image to the output OME-Zarr store.
+    # Write the fused image to the output OME-Zarr store.
     # ------------------------------------------------------------------
     logger.info(
-        f"Step 6: Writing fused image to '{zarr_url}' "
+        f"Writing fused image to '{zarr_url}' "
         f"(shape: {sim_fused_all.shape}, dims: {sim_fused_all.dims})."
     )
     # Build per-channel metadata, appending _{cycle} to each label so

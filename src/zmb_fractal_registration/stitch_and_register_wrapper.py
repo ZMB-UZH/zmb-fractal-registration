@@ -5,6 +5,9 @@ from typing import Optional
 
 from ngio import ChannelSelectionModel
 
+from zmb_fractal_registration.stitch_and_register_init import (
+    OutlierFilterModel,
+)
 from zmb_fractal_registration.stitch_and_register_parallel import (
     InitArgsStitchAndRegisterParallel,
     stitch_and_register_parallel,
@@ -26,6 +29,7 @@ def stitch_and_register(
     pyramid_level: int = 0,
     show_logs: bool = False,
     log_level: int = logging.INFO,
+    outlier_filter: OutlierFilterModel = OutlierFilterModel(),
 ) -> dict:
     """Stitch and register multiple acquisitions locally.
 
@@ -51,6 +55,8 @@ def stitch_and_register(
         pyramid_level: Pyramid level used for stitching/registration.
         show_logs: If True, configure root logging so task logs are printed.
         log_level: Logging level used when show_logs is True.
+        outlier_filter: Settings for outlier registration-shift correction.
+            See `OutlierShiftCorrectionModel` for details.
     """
     if show_logs:
         if not logging.getLogger().handlers:
@@ -77,6 +83,7 @@ def stitch_and_register(
         pyramid_level=pyramid_level,
         z_project=z_project,
         keep_original_acquisitions=True,
+        outlier_filter=outlier_filter,
     )
 
     return stitch_and_register_parallel(
