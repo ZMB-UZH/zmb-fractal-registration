@@ -4,6 +4,7 @@
 # - add option to get initial positions from grid alignment instead of original stage
 #   positions in metadata
 # - add option to input different ROI table
+# - handle larger shifts between cycles by performing a pre-registration step
 
 import logging
 import shutil

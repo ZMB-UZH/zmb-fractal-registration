@@ -24,3 +24,4 @@ If `keep_original_acquisitions` is `False`, the individual input acquisitions ar
 
 - Each acquisition must contain a **`FOV_ROI_table`** with original stage coordinates to initialize the stitching.
 - Supports only **one image per acquisition per well** — plates with multiple fields of view stored as separate images per acquisition are not supported.
+- Large shifts between cycles that are not represented in the original stage coordinates are currently not handled.
