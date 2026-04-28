@@ -1,5 +1,6 @@
 """Wrapper to run stitch_and_register_parallel locally without a Fractal server."""
 
+import logging
 from typing import Optional
 
 from ngio import ChannelSelectionModel
@@ -8,6 +9,8 @@ from zmb_fractal_registration.stitch_and_register_parallel import (
     InitArgsStitchAndRegisterParallel,
     stitch_and_register_parallel,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def stitch_and_register(
@@ -21,6 +24,8 @@ def stitch_and_register(
     cycle_names: Optional[list[str]] = None,
     z_project: bool = True,
     pyramid_level: int = 0,
+    show_logs: bool = False,
+    log_level: int = logging.INFO,
 ) -> dict:
     """Stitch and register multiple acquisitions locally.
 
@@ -44,7 +49,20 @@ def stitch_and_register(
             intensity Z-projection and apply the transforms to the full 3D
             volume. If False, operate on the full volume directly.
         pyramid_level: Pyramid level used for stitching/registration.
+        show_logs: If True, configure root logging so task logs are printed.
+        log_level: Logging level used when show_logs is True.
     """
+    if show_logs:
+        if not logging.getLogger().handlers:
+            logging.basicConfig(
+                level=log_level,
+                format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            )
+        else:
+            logging.getLogger().setLevel(log_level)
+
+        logger.info("Enabled console logging for stitch_and_register wrapper.")
+
     if cycle_names is None:
         cycle_names = [f"cycle{i}" for i in range(len(input_zarr_urls))]
 
