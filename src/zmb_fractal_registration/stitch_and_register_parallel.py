@@ -5,6 +5,7 @@
 #   positions in metadata
 # - add option to input different ROI table
 # - handle larger shifts between cycles by performing a pre-registration step
+# - make more efficient
 
 import logging
 import shutil
