@@ -48,6 +48,28 @@
             "title": "AcquisitionInputModel",
             "type": "object"
           },
+          "AcquisitionsSelectionModel": {
+            "description": "Model to select which acquisitions to process.",
+            "properties": {
+              "use_all_acquisitions": {
+                "default": true,
+                "description": "If True, all acquisitions in the plate are used and `acquisitions` must\nbe empty.",
+                "title": "Use All Acquisitions",
+                "type": "boolean"
+              },
+              "acquisitions": {
+                "default": [],
+                "description": "List of acquisitions to include. Only used when `use_all_acquisitions`\nis False.",
+                "items": {
+                  "$ref": "#/$defs/AcquisitionInputModel"
+                },
+                "title": "Acquisitions",
+                "type": "array"
+              }
+            },
+            "title": "AcquisitionsSelectionModel",
+            "type": "object"
+          },
           "ChannelSelectionModel": {
             "description": "Model for channel selection.",
             "properties": {
@@ -91,12 +113,13 @@
             "description": "Not used for this task. (Standard argument for Fractal tasks, managed by Fractal server)."
           },
           "acquisitions_to_include": {
-            "items": {
-              "$ref": "#/$defs/AcquisitionInputModel"
+            "$ref": "#/$defs/AcquisitionsSelectionModel",
+            "default": {
+              "use_all_acquisitions": true,
+              "acquisitions": []
             },
             "title": "Acquisitions To Include",
-            "type": "array",
-            "description": "Optional list of acquisitions to include. If None, all acquisitions will be included."
+            "description": "Selection of acquisitions to process. If `use_all_acquisitions` is True (default), all acquisitions in the plate are used. Otherwise, only the acquisitions listed in `acquisitions` are processed."
           },
           "reference_acquisition": {
             "$ref": "#/$defs/AcquisitionInputModel",
@@ -126,7 +149,7 @@
             "default": true,
             "title": "Z Project",
             "type": "boolean",
-            "description": "If True, calculate stitching/registration on a z-projection and apply the calculated transformations to the full 3D image. If False, operate on the full image volume."
+            "description": "If True, calculate stitching/registration on a z-projection and apply the calculated transformations to the full 3D image. If False, operate on the full image volume. Only used in case of 3D images."
           },
           "keep_original_acquisitions": {
             "default": true,

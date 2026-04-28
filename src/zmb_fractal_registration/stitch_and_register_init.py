@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from ngio import ChannelSelectionModel, open_ome_zarr_plate
-from pydantic import BaseModel, validate_call
+from pydantic import BaseModel, model_validator, validate_call
 
 
 class AcquisitionInputModel(BaseModel):
@@ -18,12 +18,32 @@ class AcquisitionInputModel(BaseModel):
         If None, defaults to `cycle{acquisition_ID}`."""
 
 
+class AcquisitionsSelectionModel(BaseModel):
+    """Model to select which acquisitions to process."""
+
+    use_all_acquisitions: bool = True
+    """If True, all acquisitions in the plate are used and `acquisitions` must
+        be empty."""
+    acquisitions: list[AcquisitionInputModel] = []
+    """List of acquisitions to include. Only used when `use_all_acquisitions`
+        is False."""
+
+    @model_validator(mode="after")
+    def check_acquisitions_empty_when_use_all(self) -> "AcquisitionsSelectionModel":
+        """Validate that acquisitions list is empty when use_all_acquisitions is True."""
+        if self.use_all_acquisitions and self.acquisitions:
+            raise ValueError(
+                "`acquisitions` must be empty when `use_all_acquisitions` is True."
+            )
+        return self
+
+
 @validate_call
 def stitch_and_register_init(
     *,
     zarr_urls: list[str],
     zarr_dir: str,
-    acquisitions_to_include: Optional[list[AcquisitionInputModel]] = None,
+    acquisitions_to_include: AcquisitionsSelectionModel = AcquisitionsSelectionModel(),
     reference_acquisition: AcquisitionInputModel = AcquisitionInputModel(
         acquisition_ID=0
     ),
@@ -49,8 +69,10 @@ def stitch_and_register_init(
             (Standard argument for Fractal tasks, managed by Fractal server).
         zarr_dir: Not used for this task.
             (Standard argument for Fractal tasks, managed by Fractal server).
-        acquisitions_to_include: Optional list of acquisitions to include. If
-            None, all acquisitions will be included.
+        acquisitions_to_include: Selection of acquisitions to process. If
+            `use_all_acquisitions` is True (default), all acquisitions in the
+            plate are used. Otherwise, only the acquisitions listed in
+            `acquisitions` are processed.
         reference_acquisition: Acquisition to use as reference for
             registration.
         reference_channel: Channel to use as reference for stitching and
@@ -74,10 +96,10 @@ def stitch_and_register_init(
         ome_zarr_plate = open_ome_zarr_plate(plate_root)
         # filter acquisitions based on acquisitions_to_include
         acquisition_ids = ome_zarr_plate.acquisition_ids
-        if acquisitions_to_include:
+        if not acquisitions_to_include.use_all_acquisitions:
             acquisition_ids_filtered = []
             cycle_names = []
-            for acq in acquisitions_to_include:
+            for acq in acquisitions_to_include.acquisitions:
                 if acq.acquisition_ID in acquisition_ids:
                     acquisition_ids_filtered.append(acq.acquisition_ID)
                     if acq.optional_cycle_name:
