@@ -58,7 +58,8 @@ def stitch_and_register_init(
         pyramid_level: Pyramid level to use for stitching and registration.
         z_project: If True, calculate stitching/registration on a z-projection
             and apply the calculated transformations to the full 3D image.
-            If False, operate on the full image volume.
+            If False, operate on the full image volume. Only used in case of
+            3D images.
         keep_original_acquisitions: If True, keep original acquisitions after
             registration. If False, remove them.
     """
@@ -145,12 +146,15 @@ def stitch_and_register_init(
                     acquisition_paths.append(images[0])
 
             # TODO: think about changing new path simply to str(new_acquisition_id)
-            zarr_url_new = ome_zarr_plate.add_image(
-                row=row,
-                column=column,
-                image_path="fused",
-                acquisition_id=new_acquisition_id,
-            )
+            zarr_url_new = (
+                plate_root
+                / ome_zarr_plate.add_image(
+                    row=row,
+                    column=column,
+                    image_path="fused",
+                    acquisition_id=new_acquisition_id,
+                )
+            ).as_posix()
 
             init_args = {
                 "zarr_urls_to_register": [

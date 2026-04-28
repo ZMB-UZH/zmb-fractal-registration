@@ -2,18 +2,145 @@
   "manifest_version": "2",
   "task_list": [
     {
-      "name": "Threshold Segmentation",
-      "category": "Segmentation",
+      "name": "Stitch and register acquisitions",
+      "output_types": {
+        "stitched": true,
+        "registered": true
+      },
+      "category": "Registration",
+      "modality": "HCS",
       "tags": [
-        "Instance Segmentation",
-        "Classical segmentation"
+        "Registration",
+        "Stitching",
+        "multiview-stitcher"
       ],
-      "docs_info": "### Purpose\n- Description and documentation of the Task functionality\n- Bullet points that cover main features of the tasks.\n- Can use **full** *markdown* formatting (including embedding images).\n\n### Outputs\n- Optional section on what kind of outputs the task generates. For the thresholding_task: Generates a new label image named `label_name`.\n\n### Limitations\n- List known limitations of the task (e.g. only works for certain data types).",
-      "type": "parallel",
-      "executable_parallel": "threshold_segmentation_task.py",
+      "docs_info": "### Purpose\n\nStitches together tiles from multiple acquisitions of a plate and registers them into a single fused image per well. This task is designed for multi-cycle imaging experiments where the same well is imaged across multiple acquisitions (e.g., sequential rounds of staining).\n\nThe workflow proceeds in two steps:\n\n1. **Stitching** \u2014 tiles within the reference acquisition are stitched together using phase cross correlation.\n2. **Registration** \u2014 tiles from all other acquisitions are independently registered to the stitched reference image, correcting for shifts between cycles.\n\nKey features:\n- Uses the [`multiview_stitcher`](https://multiview-stitcher.readthedocs.io) package for stitching and registration.\n- Conceptually similar to [Ashlar](https://github.com/labsyspharm/ashlar), but also supports **3D volumes** in addition to 2D.\n- When `z_project` is enabled (default), stitching and registration are computed on a maximum-intensity Z-projection, and the resulting transformations are applied to the full 3D volume \u2014 reducing computation time.\n- All acquisitions to process can be explicitly selected via `acquisitions_to_include`; if omitted, all acquisitions in the plate are used.\n- Each acquisition can be assigned an optional **cycle name** to disambiguate channels from different rounds. If not specified, cycle names default to `cycle0`, `cycle1`, etc.\n\n### Outputs\n\nCreates a new OME-Zarr acquisition named **`fused`** within the same plate. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.\n\nIf `keep_original_acquisitions` is `False`, the individual input acquisitions are removed from the plate after fusion.\n\n### Limitations\n\n- Each acquisition must contain a **`FOV_ROI_table`** with original stage coordinates to initialize the stitching.\n- Supports only **one image per acquisition per well** \u2014 plates with multiple fields of view stored as separate images per acquisition are not supported.",
+      "type": "compound",
+      "executable_non_parallel": "stitch_and_register_init.py",
+      "executable_parallel": "stitch_and_register_parallel.py",
+      "meta_non_parallel": {
+        "cpus_per_task": 1,
+        "mem": 4000
+      },
       "meta_parallel": {
         "cpus_per_task": 1,
         "mem": 4000
+      },
+      "args_schema_non_parallel": {
+        "$defs": {
+          "AcquisitionInputModel": {
+            "description": "Input model for acquisitions.",
+            "properties": {
+              "acquisition_ID": {
+                "description": "Acquisition ID in plate.",
+                "title": "Acquisition Id",
+                "type": "integer"
+              },
+              "optional_cycle_name": {
+                "description": "Optional cycle name. Will be appended to original channel labels.\nIf None, defaults to `cycle{acquisition_ID}`.",
+                "title": "Optional Cycle Name",
+                "type": "string"
+              }
+            },
+            "required": [
+              "acquisition_ID"
+            ],
+            "title": "AcquisitionInputModel",
+            "type": "object"
+          },
+          "ChannelSelectionModel": {
+            "description": "Model for channel selection.",
+            "properties": {
+              "mode": {
+                "default": "label",
+                "description": "The mode to use for channel selection. Can be \"label\", \"wavelength_id\", or \"index\".",
+                "enum": [
+                  "label",
+                  "wavelength_id",
+                  "index"
+                ],
+                "title": "Mode",
+                "type": "string"
+              },
+              "identifier": {
+                "description": "The identifier for the channel selection. The interpretation of this field depends\non the mode:\n- If mode is \"label\", this should be the channel label.\n- If mode is \"wavelength_id\", this should be the wavelength ID of the channel.\n- If mode is \"index\", this should be the index of the channel (must be an integer).",
+                "title": "Identifier",
+                "type": "string"
+              }
+            },
+            "required": [
+              "identifier"
+            ],
+            "title": "ChannelSelectionModel",
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "zarr_urls": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Zarr Urls",
+            "type": "array",
+            "description": "List of paths or urls to the individual OME-Zarr images to be processed. (Standard argument for Fractal tasks, managed by Fractal server)."
+          },
+          "zarr_dir": {
+            "title": "Zarr Dir",
+            "type": "string",
+            "description": "Not used for this task. (Standard argument for Fractal tasks, managed by Fractal server)."
+          },
+          "acquisitions_to_include": {
+            "items": {
+              "$ref": "#/$defs/AcquisitionInputModel"
+            },
+            "title": "Acquisitions To Include",
+            "type": "array",
+            "description": "Optional list of acquisitions to include. If None, all acquisitions will be included."
+          },
+          "reference_acquisition": {
+            "$ref": "#/$defs/AcquisitionInputModel",
+            "default": {
+              "acquisition_ID": 0,
+              "optional_cycle_name": null
+            },
+            "title": "Reference Acquisition",
+            "description": "Acquisition to use as reference for registration."
+          },
+          "reference_channel": {
+            "$ref": "#/$defs/ChannelSelectionModel",
+            "default": {
+              "mode": "index",
+              "identifier": "0"
+            },
+            "title": "Reference Channel",
+            "description": "Channel to use as reference for stitching and registration."
+          },
+          "pyramid_level": {
+            "default": 0,
+            "title": "Pyramid Level",
+            "type": "integer",
+            "description": "Pyramid level to use for stitching and registration."
+          },
+          "z_project": {
+            "default": true,
+            "title": "Z Project",
+            "type": "boolean",
+            "description": "If True, calculate stitching/registration on a z-projection and apply the calculated transformations to the full 3D image. If False, operate on the full image volume."
+          },
+          "keep_original_acquisitions": {
+            "default": true,
+            "title": "Keep Original Acquisitions",
+            "type": "boolean",
+            "description": "If True, keep original acquisitions after registration. If False, remove them."
+          }
+        },
+        "required": [
+          "zarr_urls",
+          "zarr_dir"
+        ],
+        "type": "object",
+        "title": "StitchAndRegisterInit"
       },
       "args_schema_parallel": {
         "$defs": {
@@ -43,43 +170,54 @@
             "title": "ChannelSelectionModel",
             "type": "object"
           },
-          "IteratorConfiguration": {
-            "description": "Advanced Masking configuration.",
+          "InitArgsStitchAndRegisterParallel": {
+            "description": "Init Args for stitch_and_register_parallel task.",
             "properties": {
-              "masking": {
-                "$ref": "#/$defs/MaskingConfiguration",
-                "description": "If configured, the segmentation will be only saved within the mask region.\nwill be applied based on the provided masking configuration.",
-                "title": "Masking Iterator Configuration"
+              "zarr_urls_to_register": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Zarr Urls To Register",
+                "type": "array"
               },
-              "roi_table": {
-                "description": "Name of a ROI table. If provided, the segmentation will be performed for each ROI\nin the specified ROI table.",
-                "title": "Iterate Over ROIs",
-                "type": "string"
+              "cycle_names": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Cycle Names",
+                "type": "array"
+              },
+              "reference_acquisition_index": {
+                "title": "Reference Acquisition Index",
+                "type": "integer"
+              },
+              "reference_channel": {
+                "$ref": "#/$defs/ChannelSelectionModel",
+                "title": "Reference_Channel"
+              },
+              "pyramid_level": {
+                "default": 0,
+                "title": "Pyramid Level",
+                "type": "integer"
+              },
+              "z_project": {
+                "default": true,
+                "title": "Z Project",
+                "type": "boolean"
+              },
+              "keep_original_acquisitions": {
+                "default": true,
+                "title": "Keep Original Acquisitions",
+                "type": "boolean"
               }
             },
-            "title": "IteratorConfiguration",
-            "type": "object"
-          },
-          "MaskingConfiguration": {
-            "description": "Masking configuration.",
-            "properties": {
-              "mode": {
-                "default": "Table Name",
-                "description": "Mode of masking to be applied. If \"Table Name\", the identifier refers to a\nmasking table name.\nIf \"Table Name\", the identifier refers to a masking table name.\nIf \"Label Name\", the identifier refers to a label image name.",
-                "enum": [
-                  "Table Name",
-                  "Label Name"
-                ],
-                "title": "Mode",
-                "type": "string"
-              },
-              "identifier": {
-                "description": "Name of the masking table or label image depending on the mode.",
-                "title": "Identifier",
-                "type": "string"
-              }
-            },
-            "title": "MaskingConfiguration",
+            "required": [
+              "zarr_urls_to_register",
+              "cycle_names",
+              "reference_acquisition_index",
+              "reference_channel"
+            ],
+            "title": "InitArgsStitchAndRegisterParallel",
             "type": "object"
           }
         },
@@ -88,163 +226,21 @@
           "zarr_url": {
             "title": "Zarr Url",
             "type": "string",
-            "description": "URL to the OME-Zarr container"
+            "description": "Absolute path to the new OME-Zarr image."
           },
-          "channel": {
-            "$ref": "#/$defs/ChannelSelectionModel",
-            "title": "Channel",
-            "description": "Select the input channel to be used for segmentation."
-          },
-          "label_name": {
-            "title": "Label Name",
-            "type": "string",
-            "description": "Name of the resulting label image. If not provided, it will be set to \"<channel_identifier>_thresholded\"."
-          },
-          "threshold": {
-            "title": "Threshold",
-            "type": "integer",
-            "description": "Threshold value to be applied."
-          },
-          "min_size": {
-            "default": 50,
-            "title": "Min Size",
-            "type": "integer",
-            "description": "Minimum size of objects. Smaller objects are filtered out."
-          },
-          "iterator_configuration": {
-            "$ref": "#/$defs/IteratorConfiguration",
-            "title": "Iterator Configuration",
-            "description": "Advanced configuration to control masked and ROI-based iteration."
-          },
-          "overwrite": {
-            "default": true,
-            "title": "Overwrite",
-            "type": "boolean",
-            "description": "Whether to overwrite an existing label image. Defaults to True."
+          "init_args": {
+            "$ref": "#/$defs/InitArgsStitchAndRegisterParallel",
+            "title": "Init Args",
+            "description": "Initialization arguments from the init task."
           }
         },
         "required": [
           "zarr_url",
-          "channel",
-          "threshold"
+          "init_args"
         ],
         "type": "object",
-        "title": "ThresholdSegmentationTask"
-      },
-      "docs_link": ""
-    },
-    {
-      "name": "Gaussian Blur",
-      "output_types": {
-        "is_blurred": true
-      },
-      "category": "Image Processing",
-      "tags": [
-        "Denoising",
-        "Gaussian Blur"
-      ],
-      "docs_info": "### Purpose\n- Description and documentation of the Task functionality\n- Bullet points that cover main features of the tasks.\n- Can use **full** *markdown* formatting (including embedding images).\n\n### Outputs\n- Optional section on what kind of outputs the task generates. For the thresholding_task: Generates a new label image named `label_name`.\n\n### Limitations\n- List known limitations of the task (e.g. only works for certain data types).",
-      "type": "parallel",
-      "executable_parallel": "gaussian_blur_task.py",
-      "meta_parallel": {
-        "cpus_per_task": 1,
-        "mem": 4000
-      },
-      "args_schema_parallel": {
-        "additionalProperties": false,
-        "properties": {
-          "zarr_url": {
-            "title": "Zarr Url",
-            "type": "string",
-            "description": "URL to the OME-Zarr container."
-          },
-          "output_image_suffix": {
-            "default": "gaussian_blur",
-            "title": "Output Image Suffix",
-            "type": "string",
-            "description": "Suffix for the output image name."
-          },
-          "sigma_xy": {
-            "default": 1.0,
-            "title": "Sigma Xy",
-            "type": "number",
-            "description": "Standard deviation for Gaussian kernel in the XY plane. Defaults to 1.0."
-          },
-          "sigma_z": {
-            "title": "Sigma Z",
-            "type": "number",
-            "description": "Standard deviation for Gaussian kernel in the Z direction. If None, the smoothing will be applied only in XY."
-          },
-          "overwrite": {
-            "default": true,
-            "title": "Overwrite",
-            "type": "boolean",
-            "description": "Whether to overwrite an existing output image. Defaults to True."
-          },
-          "overwrite_input": {
-            "default": false,
-            "title": "Overwrite Input",
-            "type": "boolean",
-            "description": "If True, the task will first create a new OME-Zarr image with the Gaussian blur applied, and then overwrite the original image with the new one. Defaults to False."
-          }
-        },
-        "required": [
-          "zarr_url"
-        ],
-        "type": "object",
-        "title": "GaussianBlurTask"
-      },
-      "docs_link": ""
-    },
-    {
-      "name": "Region Props Features",
-      "category": "Measurement",
-      "tags": [
-        "Region Properties",
-        "Intensity",
-        "Morphology"
-      ],
-      "docs_info": "### Purpose\n- Description and documentation of the Task functionality\n- Bullet points that cover main features of the tasks.\n- Can use **full** *markdown* formatting (including embedding images).\n\n### Outputs\n- Optional section on what kind of outputs the task generates. For the thresholding_task: Generates a new label image named `label_name`.\n\n### Limitations\n- List known limitations of the task (e.g. only works for certain data types).",
-      "type": "parallel",
-      "executable_parallel": "region_props_features_task.py",
-      "meta_parallel": {
-        "cpus_per_task": 1,
-        "mem": 4000
-      },
-      "args_schema_parallel": {
-        "additionalProperties": false,
-        "properties": {
-          "zarr_url": {
-            "title": "Zarr Url",
-            "type": "string",
-            "description": "URL to the OME-Zarr container"
-          },
-          "label_image_name": {
-            "title": "Label Image Name",
-            "type": "string",
-            "description": "Name of the label image to analyze."
-          },
-          "output_table_name": {
-            "default": "region_props_features",
-            "title": "Output Table Name",
-            "type": "string",
-            "description": "Name for the output feature table."
-          },
-          "overwrite": {
-            "default": true,
-            "title": "Overwrite",
-            "type": "boolean",
-            "description": "Whether to overwrite an existing feature table. Defaults to True."
-          }
-        },
-        "required": [
-          "zarr_url",
-          "label_image_name"
-        ],
-        "type": "object",
-        "title": "RegionPropsFeaturesTask"
-      },
-      "docs_link": ""
+        "title": "StitchAndRegisterParallel"
+      }
     }
   ],
   "has_args_schemas": true,
