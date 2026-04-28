@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import xarray as xr
+from dask import compute, delayed
 from multiview_stitcher import (
     fusion,
     msi_utils,
@@ -204,6 +205,10 @@ def stitch_and_register_parallel(
     )
     z_project = init_args.z_project
 
+    # ------------------------------------------------------------------
+    # Step 1: Load all FOVs from each cycle at the registration pyramid
+    # level, optionally projecting along z.
+    # ------------------------------------------------------------------ 
     msims_reg = {}
     for cycle in cycles:
         fov_roi_table = containers[cycle].get_table("FOV_ROI_table")
@@ -214,6 +219,10 @@ def stitch_and_register_parallel(
             z_project=z_project,
         )
 
+    # ------------------------------------------------------------------
+    # Step 2: Stitch the reference cycle - align its tiles relative to
+    # each other using the stage positions as the starting point.
+    # ------------------------------------------------------------------
     registration.register(
         msims_reg[ref_cycle],
         reg_channel=reg_channel,
@@ -222,14 +231,18 @@ def stitch_and_register_parallel(
         pre_registration_pruning_method="keep_axis_aligned",
     )
 
+    # Fuse the stitched reference tiles into a single reference image (lazily and at the
+    # sub-resolution). This is then used as the fixed target for registering the tiles
+    # of the other cycles.
     sim_fused_ref_ds = fusion.fuse(
         [msi_utils.get_sim_from_msim(msim) for msim in msims_reg[ref_cycle]],
         transform_key="affine_registered",
-        output_chunksize=1024,
+        output_chunksize=1024,  #TODO: optimize chunksize
     )
     sim_fused_ref_ds.transforms["fractal_input"] = sim_fused_ref_ds.transforms[
         "affine_registered"
     ]
+    # Mask out regions not covered by any tile (outside the stitched FOV).
     sim_fused_ref_ds_mask = fusion.fuse(
         [
             xr.ones_like(msi_utils.get_sim_from_msim(msim))
@@ -240,11 +253,17 @@ def stitch_and_register_parallel(
     )
     sim_fused_ref_ds = xr.where(sim_fused_ref_ds_mask > 0, sim_fused_ref_ds, np.nan)
 
+    # ------------------------------------------------------------------
+    # Step 3: Register each non-reference cycle tile individually against
+    # the fused reference image. Tiles across all cycles are registered
+    # in parallel using dask.
+    # ------------------------------------------------------------------
+    delayed_tasks = []
     for cycle in cycles:
         if cycle == ref_cycle:
             continue
         for msim in msims_reg[cycle]:
-            registration.register(
+            task = delayed(registration.register)(
                 [msi_utils.get_msim_from_sim(sim_fused_ref_ds), msim],
                 reg_channel=reg_channel,
                 transform_key="fractal_input",
@@ -253,7 +272,14 @@ def stitch_and_register_parallel(
                 groupwise_resolution_kwargs={"reference_view": 0},
                 reg_res_level=0,
             )
+            delayed_tasks.append(task)
+    compute(*delayed_tasks)
 
+    # ------------------------------------------------------------------
+    # Step 4: Reload FOVs at full resolution and transfer the computed
+    # transforms. When z_project was used, expand the 2D affine back to
+    # 3D (identity in z) before applying it to the full volume.
+    # ------------------------------------------------------------------
     msims_fusion = {}
     for cycle in cycles:
         fov_roi_table = containers[cycle].get_table("FOV_ROI_table")
@@ -281,6 +307,10 @@ def stitch_and_register_parallel(
 
             msi_utils.set_affine_transform(msim_fus, affine, "affine_registered")
 
+    # ------------------------------------------------------------------
+    # Step 5: Determine the bounding box that contains all transformed
+    # tiles across all cycles, then fuse each cycle into that canvas.
+    # ------------------------------------------------------------------
     origins_all = []
     antipodes_all = []
     for cycle in cycles:
@@ -315,12 +345,19 @@ def stitch_and_register_parallel(
             output_shape=global_shape,
         )
 
+    # Concatenate all cycles along the channel axis and drop any singleton
+    # dimensions that are not present in the reference image axes.
     sim_fused_all = xr.concat([sims_fused[cycle] for cycle in cycles], dim="c")
     axes_in = containers[ref_cycle].get_image().axes
     sim_fused_all = sim_fused_all.squeeze(
         [dim for dim in sim_fused_all.dims if dim not in axes_in]
     )
 
+    # ------------------------------------------------------------------
+    # Step 6: Write the fused image to the output OME-Zarr store.
+    # ------------------------------------------------------------------
+    # Build per-channel metadata, appending _{cycle} to each label so
+    # channels from different cycles can be distinguished.
     channels_meta_all = []
     for cycle in cycles:
         channels = containers[cycle].images_container.channels_meta.channels
@@ -354,6 +391,7 @@ def stitch_and_register_parallel(
         logging.info("Keeping original acquisitions.")
         return {"image_list_updates": image_list_updates}
 
+    # Remove the original per-cycle acquisitions from disk.
     for url in init_args.zarr_urls_to_register:
         logging.info(f"Deleting original acquisition at {url}")
         shutil.rmtree(url)
