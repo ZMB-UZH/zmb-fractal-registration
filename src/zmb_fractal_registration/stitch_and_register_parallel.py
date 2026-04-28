@@ -340,6 +340,7 @@ def stitch_and_register_parallel(
     # exceeds `outlier_filter.threshold` µm, is reset to the inlier mean
     # shift.
     # ------------------------------------------------------------------
+    # TODO: review this part
     osc = init_args.outlier_filter
     if osc.mode != "disabled":
         if osc.mode == "zscore":
@@ -416,18 +417,23 @@ def stitch_and_register_parallel(
                         f"{np.round(mean_shift, 3)}."
                     )
                     sim = msi_utils.get_sim_from_msim(msim)
-                    affine_in = get_affine_from_sim(sim, transform_key="fractal_input")
-                    # Use numpy modification (consistent with
-                    # _get_affine_translation) to avoid relying on
-                    # the string coord labels of x_in / x_out.
+                    # Base the corrected affine on affine_registered so
+                    # that its dimension structure (including any 't' coord
+                    # added by multiview_stitcher) is preserved.
+                    affine_reg = get_affine_from_sim(
+                        sim, transform_key="affine_registered"
+                    )
+                    t_in = _get_affine_translation(
+                        get_affine_from_sim(sim, transform_key="fractal_input")
+                    )
                     sel_dict_af = {
-                        dim: affine_in.coords[dim][0].values
-                        for dim in affine_in.dims
+                        dim: affine_reg.coords[dim][0].values
+                        for dim in affine_reg.dims
                         if dim not in ["x_in", "x_out"]
                     }
-                    a = np.array(affine_in.sel(sel_dict_af))
-                    a[: len(mean_shift), -1] += mean_shift
-                    affine_corrected = affine_in.copy(deep=True)
+                    a = np.array(affine_reg.sel(sel_dict_af))
+                    a[: len(mean_shift), -1] = t_in + mean_shift
+                    affine_corrected = affine_reg.copy(deep=True)
                     affine_corrected.loc[sel_dict_af] = a
                     msi_utils.set_affine_transform(
                         msim, affine_corrected, "affine_registered"

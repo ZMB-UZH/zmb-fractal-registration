@@ -27,9 +27,9 @@ def stitch_and_register(
     cycle_names: Optional[list[str]] = None,
     z_project: bool = True,
     pyramid_level: int = 0,
+    outlier_filter: OutlierFilterModel = OutlierFilterModel(),
     show_logs: bool = False,
     log_level: int = logging.INFO,
-    outlier_filter: OutlierFilterModel = OutlierFilterModel(),
 ) -> dict:
     """Stitch and register multiple acquisitions locally.
 
@@ -53,10 +53,10 @@ def stitch_and_register(
             intensity Z-projection and apply the transforms to the full 3D
             volume. If False, operate on the full volume directly.
         pyramid_level: Pyramid level used for stitching/registration.
-        show_logs: If True, configure root logging so task logs are printed.
-        log_level: Logging level used when show_logs is True.
         outlier_filter: Settings for outlier registration-shift correction.
             See `OutlierShiftCorrectionModel` for details.
+        show_logs: If True, configure root logging so task logs are printed.
+        log_level: Logging level used when show_logs is True.
     """
     if show_logs:
         if not logging.getLogger().handlers:
