@@ -24,5 +24,3 @@ TASK_LIST = [
         output_types={"stitched": True, "registered": True},
     ),
 ]
-
-

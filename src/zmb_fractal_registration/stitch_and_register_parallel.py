@@ -208,7 +208,7 @@ def stitch_and_register_parallel(
     # ------------------------------------------------------------------
     # Step 1: Load all FOVs from each cycle at the registration pyramid
     # level, optionally projecting along z.
-    # ------------------------------------------------------------------ 
+    # ------------------------------------------------------------------
     msims_reg = {}
     for cycle in cycles:
         fov_roi_table = containers[cycle].get_table("FOV_ROI_table")
@@ -237,7 +237,7 @@ def stitch_and_register_parallel(
     sim_fused_ref_ds = fusion.fuse(
         [msi_utils.get_sim_from_msim(msim) for msim in msims_reg[ref_cycle]],
         transform_key="affine_registered",
-        output_chunksize=1024,  #TODO: optimize chunksize
+        output_chunksize=1024,  # TODO: optimize chunksize
     )
     sim_fused_ref_ds.transforms["fractal_input"] = sim_fused_ref_ds.transforms[
         "affine_registered"

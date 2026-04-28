@@ -15,9 +15,9 @@ from zmb_fractal_registration.stitch_and_register_parallel import (
     stitch_and_register_parallel,
 )
 
-_PIXEL_SIZE = 0.325  # µm/px (default for create_synthetic_ome_zarr Cardiomyocyte)
+_PIXEL_SIZE = 0.325  # um/px (default for create_synthetic_ome_zarr Cardiomyocyte)
 _FOV_PX = 64  # pixels per FOV side
-_OVERLAP_PX = 32  # 50% overlap → enough for multiview_stitcher adjacency detection
+_OVERLAP_PX = 32  # 50% overlap -> enough for multiview_stitcher adjacency detection
 
 
 def _create_test_plate(plate_path: Path) -> list[str]:
@@ -52,9 +52,10 @@ def _create_test_plate(plate_path: Path) -> list[str]:
         )
 
         # Two FOVs side-by-side with 50% overlap in x.
-        # FOV 1: world x=[0, fov_size_um]        → pixels x=[0:FOV_PX]
+        # FOV 1: world x=[0, fov_size_um]
+        #   -> pixels x=[0:FOV_PX]
         # FOV 2: world x=[fov_size_um-overlap_um, 2*fov_size_um-overlap_um]
-        #                                         → pixels x=[OVERLAP_PX:2*FOV_PX-OVERLAP_PX]
+        #   -> pixels x=[OVERLAP_PX:2*FOV_PX-OVERLAP_PX]
         rois = [
             Roi.from_values(
                 slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
@@ -107,7 +108,7 @@ def test_stitch_and_register(tmp_path: Path):
     fused_images = list(plate.get_images(acquisition=fused_acq_id).values())
     assert len(fused_images) == 1
 
-    # Check that channels from both cycles are present (1 channel × 2 cycles = 2)
+    # Check that channels from both cycles are present (1 channel x 2 cycles = 2)
     fused_image = fused_images[0].get_image()
     assert len(fused_image.channel_labels) == 2
     assert any("DAPI" in label for label in fused_image.channel_labels)
