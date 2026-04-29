@@ -5,7 +5,8 @@
 #   positions in metadata
 # - add option to input different ROI table
 # - handle larger shifts between cycles by performing a pre-registration step
-# - make more efficient
+# - optimize dask parallelization
+# - clean up function structure and break into smaller functions where possible
 
 import logging
 import shutil
@@ -341,6 +342,8 @@ def stitch_and_register_parallel(
     # shift.
     # ------------------------------------------------------------------
     # TODO: review this part
+    # TODO: correct not with mean shift of all inliers, but interpolate from nearby
+    # inliers
     osc = init_args.outlier_filter
     if osc.mode != "disabled":
         if osc.mode == "zscore":
