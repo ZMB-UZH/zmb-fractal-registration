@@ -120,6 +120,21 @@ def _get_msims(
     return msims
 
 
+def _xaffine_to_matrix(xaffine: xr.DataArray) -> np.ndarray:
+    """Extract a (ndim+1, ndim+1) numpy matrix from an affine DataArray.
+
+    multiview-stitcher affine DataArrays always carry a 't' dimension
+    internally. This function selects the first coordinate along any
+    non-spatial dimension to collapse it down to a plain 2-D matrix.
+    """
+    sel_dict = {
+        dim: xaffine.coords[dim][0].values
+        for dim in xaffine.dims
+        if dim not in ["x_in", "x_out"]
+    }
+    return np.array(xaffine.sel(sel_dict))
+
+
 def _get_origin_of_sim(sim, transform_key: str | None = None) -> dict[str, float]:
     """Get transformed origin for a spatial image."""
     ndim = get_ndim_from_sim(sim)
@@ -127,13 +142,7 @@ def _get_origin_of_sim(sim, transform_key: str | None = None) -> dict[str, float
     origin = np.array([origin[dim] for dim in get_spatial_dims_from_sim(sim)])
 
     if transform_key is not None:
-        affine = get_affine_from_sim(sim, transform_key=transform_key)
-        sel_dict = {
-            dim: affine.coords[dim][0].values
-            for dim in affine.dims
-            if dim not in ["x_in", "x_out"]
-        }
-        affine = np.array(affine.sel(sel_dict))
+        affine = _xaffine_to_matrix(get_affine_from_sim(sim, transform_key=transform_key))
         origin = np.concatenate([origin, np.ones(1)])
         origin = np.matmul(affine, origin)[:ndim]
 
@@ -155,32 +164,11 @@ def _get_antipode_of_sim(sim, transform_key: str | None = None) -> dict[str, flo
     )
 
     if transform_key is not None:
-        affine = get_affine_from_sim(sim, transform_key=transform_key)
-        sel_dict = {
-            dim: affine.coords[dim][0].values
-            for dim in affine.dims
-            if dim not in ["x_in", "x_out"]
-        }
-        affine = np.array(affine.sel(sel_dict))
+        affine = _xaffine_to_matrix(get_affine_from_sim(sim, transform_key=transform_key))
         antipode = np.concatenate([antipode, np.ones(1)])
         antipode = np.matmul(affine, antipode)[:ndim]
 
     return dict(zip(get_spatial_dims_from_sim(sim), antipode, strict=True))
-
-
-def _xaffine_to_matrix(xaffine: xr.DataArray) -> np.ndarray:
-    """Extract a (ndim+1, ndim+1) numpy matrix from an affine DataArray.
-
-    multiview-stitcher affine DataArrays always carry a 't' dimension
-    internally. This function selects the first coordinate along any
-    non-spatial dimension to collapse it down to a plain 2-D matrix.
-    """
-    sel_dict = {
-        dim: xaffine.coords[dim][0].values
-        for dim in xaffine.dims
-        if dim not in ["x_in", "x_out"]
-    }
-    return np.array(xaffine.sel(sel_dict))
 
 
 def _resolve_registration_channel(image, selector: ChannelSelectionModel) -> str:
@@ -191,6 +179,25 @@ def _resolve_registration_channel(image, selector: ChannelSelectionModel) -> str
         idx = image.get_channel_idx(selector.identifier)
         return image.channel_labels[idx]
     return selector.identifier
+
+
+def _fuse_masked(sims: list):
+    """Fuse spatial images, mask non-tile regions with NaN, and alias the transform.
+
+    All sims must have an "affine_registered" transform. The returned image
+    has NaN outside the union of tile footprints and an additional
+    "fractal_input" transform alias pointing to "affine_registered".
+    """
+    # TODO: optimize chunksize
+    sim_fused = fusion.fuse(sims, transform_key="affine_registered", output_chunksize=1024)
+    mask = fusion.fuse(
+        [xr.ones_like(s) for s in sims],
+        transform_key="affine_registered",
+        output_chunksize=1024,
+    )
+    sim_fused = xr.where(mask > 0, sim_fused, np.nan)
+    sim_fused.transforms["fractal_input"] = sim_fused.transforms["affine_registered"]
+    return sim_fused
 
 
 def _stitch_and_fuse_reference(msims_ref: list, reg_channel: str):
@@ -206,23 +213,44 @@ def _stitch_and_fuse_reference(msims_ref: list, reg_channel: str):
         new_transform_key="affine_registered",
         pre_registration_pruning_method="keep_axis_aligned",
     )
+    return _fuse_masked([msi_utils.get_sim_from_msim(msim) for msim in msims_ref])
 
-    sim_fused = fusion.fuse(
-        [msi_utils.get_sim_from_msim(msim) for msim in msims_ref],
-        transform_key="affine_registered",
-        output_chunksize=1024,  # TODO: optimize chunksize
-    )
-    # Expose the fused image under the "fractal_input" key so that the
-    # per-tile registration step can use a consistent transform_key.
-    sim_fused.transforms["fractal_input"] = sim_fused.transforms["affine_registered"]
 
-    # Mask regions not covered by any reference tile.
-    mask = fusion.fuse(
-        [xr.ones_like(msi_utils.get_sim_from_msim(msim)) for msim in msims_ref],
-        transform_key="affine_registered",
-        output_chunksize=1024,
-    )
-    return xr.where(mask > 0, sim_fused, np.nan)
+def _has_overlap_with_reference_tiles(
+    msim, ref_msims: list, transform_key: str, ref_transform_key: str
+) -> bool:
+    """Return True if msim has spatial overlap with any tile in ref_msims.
+
+    Overlap is checked using axis-aligned bounding boxes in world space.
+    transform_key is used for msim; ref_transform_key is used for each
+    reference tile (typically the stitched transform after Step 2).
+    A return value of False means the tile does not spatially overlap with
+    any reference tile and registration would produce an unreliable result.
+    """
+    sim = msi_utils.get_sim_from_msim(msim)
+    nsdims = si_utils.get_nonspatial_dims_from_sim(sim)
+    if nsdims:
+        sim = si_utils.sim_sel_coords(
+            sim, {nd: sim.coords[nd][0] for nd in nsdims}
+        )
+    tile_sp = si_utils.get_stack_properties_from_sim(sim, transform_key=transform_key)
+
+    for ref_msim in ref_msims:
+        ref_sim = msi_utils.get_sim_from_msim(ref_msim)
+        ref_nsdims = si_utils.get_nonspatial_dims_from_sim(ref_sim)
+        if ref_nsdims:
+            ref_sim = si_utils.sim_sel_coords(
+                ref_sim, {nd: ref_sim.coords[nd][0] for nd in ref_nsdims}
+            )
+        ref_sp = si_utils.get_stack_properties_from_sim(
+            ref_sim, transform_key=ref_transform_key
+        )
+        overlap_area, _ = mv_graph.get_overlap_between_pair_of_stack_props(
+            tile_sp, ref_sp
+        )
+        if overlap_area > 0:
+            return True
+    return False
 
 
 def _register_cycle_tiles(
@@ -234,7 +262,7 @@ def _register_cycle_tiles(
     """Register all tiles in one non-reference cycle against the fused reference.
 
     Tiles that have no spatial overlap with any reference tile are skipped and
-    their indices are returned so the caller can apply the inlier mean shift.
+    their indices are returned for re-registration in Step 4.
     Overlapping tiles are registered via dask-delayed tasks (computed here).
 
     Returns:
@@ -378,20 +406,9 @@ def _register_leftover_tiles(
         f"  Cycle '{cycle}': fusing {len(ok_indices)} inlier tile(s) as "
         f"reference for re-registration of {len(tiles_to_correct)} leftover tile(s)."
     )
-    sim_fused_inliers = fusion.fuse(
-        [msi_utils.get_sim_from_msim(msims[i]) for i in ok_indices],
-        transform_key="affine_registered",
-        output_chunksize=1024,
+    sim_fused_inliers = _fuse_masked(
+        [msi_utils.get_sim_from_msim(msims[i]) for i in ok_indices]
     )
-    mask = fusion.fuse(
-        [xr.ones_like(msi_utils.get_sim_from_msim(msims[i])) for i in ok_indices],
-        transform_key="affine_registered",
-        output_chunksize=1024,
-    )
-    sim_fused_inliers = xr.where(mask > 0, sim_fused_inliers, np.nan)
-    sim_fused_inliers.transforms["fractal_input"] = sim_fused_inliers.transforms[
-        "affine_registered"
-    ]
 
     delayed_tasks = []
     for tile_idx in sorted(tiles_to_correct):
@@ -409,43 +426,6 @@ def _register_leftover_tiles(
         )
         delayed_tasks.append(task)
     compute(*delayed_tasks)
-
-
-def _has_overlap_with_reference_tiles(
-    msim, ref_msims: list, transform_key: str, ref_transform_key: str
-) -> bool:
-    """Return True if msim has spatial overlap with any tile in ref_msims.
-
-    Overlap is checked using axis-aligned bounding boxes in world space.
-    transform_key is used for msim; ref_transform_key is used for each
-    reference tile (typically the stitched transform after Step 2).
-    A return value of False means the tile does not spatially overlap with
-    any reference tile and registration would produce an unreliable result.
-    """
-    sim = msi_utils.get_sim_from_msim(msim)
-    nsdims = si_utils.get_nonspatial_dims_from_sim(sim)
-    if nsdims:
-        sim = si_utils.sim_sel_coords(
-            sim, {nd: sim.coords[nd][0] for nd in nsdims}
-        )
-    tile_sp = si_utils.get_stack_properties_from_sim(sim, transform_key=transform_key)
-
-    for ref_msim in ref_msims:
-        ref_sim = msi_utils.get_sim_from_msim(ref_msim)
-        ref_nsdims = si_utils.get_nonspatial_dims_from_sim(ref_sim)
-        if ref_nsdims:
-            ref_sim = si_utils.sim_sel_coords(
-                ref_sim, {nd: ref_sim.coords[nd][0] for nd in ref_nsdims}
-            )
-        ref_sp = si_utils.get_stack_properties_from_sim(
-            ref_sim, transform_key=ref_transform_key
-        )
-        overlap_area, _ = mv_graph.get_overlap_between_pair_of_stack_props(
-            tile_sp, ref_sp
-        )
-        if overlap_area > 0:
-            return True
-    return False
 
 
 @validate_call
