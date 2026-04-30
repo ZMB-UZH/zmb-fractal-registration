@@ -171,7 +171,9 @@ def _get_antipode_of_sim(sim, transform_key: str | None = None) -> dict[str, flo
 def _xaffine_to_matrix(xaffine: xr.DataArray) -> np.ndarray:
     """Extract a (ndim+1, ndim+1) numpy matrix from an affine DataArray.
 
-    Selects the first coordinate along any non-spatial dimensions (e.g. 't').
+    multiview-stitcher affine DataArrays always carry a 't' dimension
+    internally. This function selects the first coordinate along any
+    non-spatial dimension to collapse it down to a plain 2-D matrix.
     """
     sel_dict = {
         dim: xaffine.coords[dim][0].values
@@ -289,125 +291,124 @@ def _collect_shifts(msims: list, no_overlap_set: set) -> tuple[list[int], list]:
     return reg_tile_indices, shifts
 
 
-def _compute_inlier_mean_shift(
+def _detect_outlier_tiles(
     shifts: list,
     reg_tile_indices: list[int],
     osc: "OutlierFilterModel",
     cycle: str,
-) -> tuple[np.ndarray | None, set[int]]:
-    """Detect outlier tiles and compute the inlier mean shift.
-
-    Args:
-        shifts: Shift vector per registered tile.
-        reg_tile_indices: Tile index corresponding to each shift.
-        osc: Outlier filter settings.
-        cycle: Cycle name (used only for log messages).
+) -> set[int]:
+    """Detect tiles whose registration shift deviates too much from the mean.
 
     Returns:
-        mean_shift: Mean shift of inlier tiles, or None when *shifts* is empty.
         outlier_tile_indices: Set of tile indices flagged as outliers.
     """
-    if not shifts:
-        logger.warning(
-            f"  Cycle '{cycle}': no registered tiles; cannot compute "
-            f"inlier mean shift. All tiles will keep their stage position."
-        )
-        return None, set()
+    if not shifts or osc.mode == "disabled":
+        return set()
 
-    inlier_mask = [True] * len(shifts)
-    outlier_tile_indices: set[int] = set()
-
-    if osc.mode != "disabled":
-        initial_mean = np.mean(shifts, axis=0)
-        deviations = np.array(
-            [float(np.linalg.norm(s - initial_mean)) for s in shifts]
-        )
-
-        if osc.mode == "zscore":
-            mean_dev = float(np.mean(deviations))
-            std_dev = float(np.std(deviations))
-            zscores = (
-                (deviations - mean_dev) / std_dev
-                if std_dev > 0
-                else np.zeros_like(deviations)
-            )
-            is_outlier = zscores > osc.threshold
-            score_label, scores = "z-score", zscores
-        else:
-            is_outlier = deviations > osc.threshold
-            score_label, scores = "deviation (µm)", deviations
-
-        for list_idx, tile_idx in enumerate(reg_tile_indices):
-            if is_outlier[list_idx]:
-                logger.warning(
-                    f"  Cycle '{cycle}', tile {tile_idx}: shift "
-                    f"{np.round(shifts[list_idx], 3)} "
-                    f"({score_label}={scores[list_idx]:.2f}) "
-                    f"flagged as outlier."
-                )
-                inlier_mask[list_idx] = False
-                outlier_tile_indices.add(tile_idx)
-
-    inlier_shifts = [s for s, ok in zip(shifts, inlier_mask, strict=True) if ok]
-
-    if inlier_shifts:
-        mean_shift = np.mean(inlier_shifts, axis=0)
-    else:
-        logger.warning(
-            f"  Cycle '{cycle}': all registered tiles flagged as outliers; "
-            f"falling back to full-tile mean."
-        )
-        mean_shift = np.mean(shifts, axis=0)
-
-    logger.info(
-        f"  Cycle '{cycle}': inlier mean shift (µm) = "
-        f"{np.round(mean_shift, 3)} "
-        f"({len(inlier_shifts)}/{len(shifts)} inlier registered tiles)"
+    initial_mean = np.mean(shifts, axis=0)
+    deviations = np.array(
+        [float(np.linalg.norm(s - initial_mean)) for s in shifts]
     )
-    return mean_shift, outlier_tile_indices
+
+    if osc.mode == "zscore":
+        mean_dev = float(np.mean(deviations))
+        std_dev = float(np.std(deviations))
+        zscores = (
+            (deviations - mean_dev) / std_dev
+            if std_dev > 0
+            else np.zeros_like(deviations)
+        )
+        is_outlier = zscores > osc.threshold
+        score_label, scores = "z-score", zscores
+    else:
+        is_outlier = deviations > osc.threshold
+        score_label, scores = "deviation (µm)", deviations
+
+    outlier_tile_indices: set[int] = set()
+    for list_idx, tile_idx in enumerate(reg_tile_indices):
+        if is_outlier[list_idx]:
+            logger.warning(
+                f"  Cycle '{cycle}', tile {tile_idx}: shift "
+                f"{np.round(shifts[list_idx], 3)} "
+                f"({score_label}={scores[list_idx]:.2f}) "
+                f"flagged as outlier."
+            )
+            outlier_tile_indices.add(tile_idx)
+
+    return outlier_tile_indices
 
 
-def _apply_shift_correction(
+def _register_leftover_tiles(
     msims: list,
     tiles_to_correct: set[int],
-    no_overlap_set: set[int],
-    mean_shift: np.ndarray | None,
+    reg_channel: str,
     cycle: str,
 ) -> None:
-    """Apply the inlier mean shift (or stage position) to the given tiles."""
-    for tile_idx in sorted(tiles_to_correct):
-        msim = msims[tile_idx]
-        sim = msi_utils.get_sim_from_msim(msim)
-        affine_in_xr = get_affine_from_sim(sim, transform_key="fractal_input")
-        t_coords = affine_in_xr.coords["t"].values if "t" in affine_in_xr.dims else None
-        a = _xaffine_to_matrix(affine_in_xr)
+    """Re-register outlier and no-overlap tiles against the fused inlier image.
 
-        if mean_shift is not None:
-            if tile_idx in no_overlap_set:
-                logger.warning(
-                    f"  Cycle '{cycle}', tile {tile_idx}: no overlap with "
-                    f"reference tiles. Applying inlier mean shift "
-                    f"{np.round(mean_shift, 3)}."
-                )
-            else:
-                logger.warning(
-                    f"  Cycle '{cycle}', tile {tile_idx}: replacing outlier "
-                    f"shift with inlier mean {np.round(mean_shift, 3)}."
-                )
-            a = a.copy()
-            a[: len(mean_shift), -1] = param_utils.translation_from_affine(a) + mean_shift
-        else:
-            logger.warning(
-                f"  Cycle '{cycle}', tile {tile_idx}: no overlap with "
-                f"reference tiles and no inlier mean available. "
-                f"Keeping stage position."
-            )
+    Inlier tiles (all tiles not in tiles_to_correct) are fused into a single
+    reference image. Each leftover tile is then registered against this fused
+    inlier, starting from its stage position (fractal_input), with the fused
+    inlier held fixed.
 
-        msi_utils.set_affine_transform(
-            msim,
-            param_utils.affine_to_xaffine(a, t_coords=t_coords),
-            "affine_registered",
+    For both no-overlap tiles (affine_registered never set) and outlier tiles
+    (affine_registered unreliable), fractal_input is used as the starting
+    transform so the registration is seeded from the stage position.
+
+    Falls back to the stage position if there are no inlier tiles to fuse.
+    """
+    if not tiles_to_correct:
+        return
+
+    ok_indices = [i for i in range(len(msims)) if i not in tiles_to_correct]
+
+    if not ok_indices:
+        logger.warning(
+            f"  Cycle '{cycle}': no inlier tiles to fuse as reference. "
+            f"Leftover tiles will keep their stage position."
         )
+        for tile_idx in sorted(tiles_to_correct):
+            msim = msims[tile_idx]
+            sim = msi_utils.get_sim_from_msim(msim)
+            affine = get_affine_from_sim(sim, transform_key="fractal_input")
+            msi_utils.set_affine_transform(msim, affine, "affine_registered")
+        return
+
+    logger.info(
+        f"  Cycle '{cycle}': fusing {len(ok_indices)} inlier tile(s) as "
+        f"reference for re-registration of {len(tiles_to_correct)} leftover tile(s)."
+    )
+    sim_fused_inliers = fusion.fuse(
+        [msi_utils.get_sim_from_msim(msims[i]) for i in ok_indices],
+        transform_key="affine_registered",
+        output_chunksize=1024,
+    )
+    mask = fusion.fuse(
+        [xr.ones_like(msi_utils.get_sim_from_msim(msims[i])) for i in ok_indices],
+        transform_key="affine_registered",
+        output_chunksize=1024,
+    )
+    sim_fused_inliers = xr.where(mask > 0, sim_fused_inliers, np.nan)
+    sim_fused_inliers.transforms["fractal_input"] = sim_fused_inliers.transforms[
+        "affine_registered"
+    ]
+
+    delayed_tasks = []
+    for tile_idx in sorted(tiles_to_correct):
+        logger.info(
+            f"  Cycle '{cycle}', tile {tile_idx}: re-registering against fused inlier image."
+        )
+        task = delayed(registration.register)(
+            [msi_utils.get_msim_from_sim(sim_fused_inliers), msims[tile_idx]],
+            reg_channel=reg_channel,
+            transform_key="fractal_input",
+            new_transform_key="affine_registered",
+            pre_registration_pruning_method=None,
+            groupwise_resolution_kwargs={"reference_view": 0},
+            reg_res_level=0,
+        )
+        delayed_tasks.append(task)
+    compute(*delayed_tasks)
 
 
 def _has_overlap_with_reference_tiles(
@@ -483,6 +484,13 @@ def stitch_and_register_parallel(
         for cycle, url in zip(cycles, init_args.zarr_urls_to_register, strict=True)
     }
 
+    for cycle in cycles:
+        if containers[cycle].is_time_series:
+            raise ValueError(
+                f"Acquisition '{cycle}' is a timeseries. "
+                f"Timeseries data is not supported."
+            )
+
     reg_image_ref = containers[ref_cycle].get_image(path=str(init_args.pyramid_level))
     reg_channel = _resolve_registration_channel(reg_image_ref, init_args.reference_channel)
     logger.info(f"Reference cycle: '{ref_cycle}', registration channel: '{reg_channel}'")
@@ -536,37 +544,30 @@ def stitch_and_register_parallel(
         if no_overlap:
             logger.warning(
                 f"  Cycle '{cycle}': {len(no_overlap)} tile(s) had no spatial "
-                f"overlap with the reference and will receive the inlier mean shift."
+                f"overlap with the reference and will be re-registered in Step 4."
             )
     logger.info("  Parallel tile registration complete.")
 
     # ------------------------------------------------------------------
-    # Step 4: Shift correction — for each non-reference cycle:
-    #   1. Collect shifts from registered tiles.
-    #   2. Detect outliers (if enabled) and add them to `tiles_to_correct`.
-    #   3. No-overlap tiles are always added to `tiles_to_correct`.
-    #   4. Compute the inlier mean shift and apply it to all corrected tiles.
+    # Step 4: For each non-reference cycle, detect outlier tiles (shifts
+    # that deviate too much from the cycle mean) and collect no-overlap
+    # tiles. Re-register all such leftover tiles against a fused image of
+    # the remaining inlier tiles, with the fused inlier held fixed.
     # ------------------------------------------------------------------
-    # TODO: correct not with mean shift of all inliers, but interpolate from nearby
-    # inliers
     osc = init_args.outlier_filter
     if osc.mode == "zscore":
-        logger.info(f"Outlier shift correction (z-score threshold: {osc.threshold}).")
+        logger.info(f"Outlier detection enabled (z-score threshold: {osc.threshold}).")
     elif osc.mode != "disabled":
-        logger.info(f"Outlier shift correction (absolute threshold: {osc.threshold} µm).")
+        logger.info(f"Outlier detection enabled (absolute threshold: {osc.threshold} µm).")
 
     for cycle in cycles:
         if cycle == ref_cycle:
             continue
         no_overlap_set = set(no_overlap_indices.get(cycle, []))
         reg_tile_indices, shifts = _collect_shifts(msims_reg[cycle], no_overlap_set)
-        mean_shift, outlier_indices = _compute_inlier_mean_shift(
-            shifts, reg_tile_indices, osc, cycle
-        )
+        outlier_indices = _detect_outlier_tiles(shifts, reg_tile_indices, osc, cycle)
         tiles_to_correct = no_overlap_set | outlier_indices
-        _apply_shift_correction(
-            msims_reg[cycle], tiles_to_correct, no_overlap_set, mean_shift, cycle
-        )
+        _register_leftover_tiles(msims_reg[cycle], tiles_to_correct, reg_channel, cycle)
 
     # ------------------------------------------------------------------
     # Step 5: Reload FOVs at full resolution and transfer the computed
