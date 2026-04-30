@@ -104,7 +104,7 @@
             "properties": {
               "mode": {
                 "default": "disabled",
-                "description": "Outlier filter mode.\n\"disabled\": No filtering applied.\n\"absolute\": Filter by absolute shift threshold in \u00b5m.\n\"zscore\": Filter by z-score threshold (shift-average_shift/standard_deviation).\n    A value of 2-3 is typical.",
+                "description": "Outlier detection method. 'absolute': threshold in um; 'zscore': z-score\nthreshold (2-3 is typical).",
                 "enum": [
                   "disabled",
                   "absolute",
@@ -114,7 +114,7 @@
                 "type": "string"
               },
               "threshold": {
-                "description": "Either absolute shift threshold in \u00b5m or z-score threshold. Tiles with shifts\nabove the threshold will be filtered out and their transformations will be replaced\nby the mean of the non-outlier shifts. Must be set if mode is not \"disabled\".",
+                "description": "Threshold value (um for 'absolute', z-score for 'zscore'). Required unless\nmode is 'disabled'.",
                 "title": "Threshold",
                 "type": "number"
               }
@@ -291,7 +291,7 @@
             "properties": {
               "mode": {
                 "default": "disabled",
-                "description": "Outlier filter mode.\n\"disabled\": No filtering applied.\n\"absolute\": Filter by absolute shift threshold in \u00b5m.\n\"zscore\": Filter by z-score threshold (shift-average_shift/standard_deviation).\n    A value of 2-3 is typical.",
+                "description": "Outlier detection method. 'absolute': threshold in um; 'zscore': z-score\nthreshold (2-3 is typical).",
                 "enum": [
                   "disabled",
                   "absolute",
@@ -301,7 +301,7 @@
                 "type": "string"
               },
               "threshold": {
-                "description": "Either absolute shift threshold in \u00b5m or z-score threshold. Tiles with shifts\nabove the threshold will be filtered out and their transformations will be replaced\nby the mean of the non-outlier shifts. Must be set if mode is not \"disabled\".",
+                "description": "Threshold value (um for 'absolute', z-score for 'zscore'). Required unless\nmode is 'disabled'.",
                 "title": "Threshold",
                 "type": "number"
               }
