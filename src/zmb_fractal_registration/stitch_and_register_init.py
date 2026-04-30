@@ -12,15 +12,11 @@ class OutlierFilterModel(BaseModel):
     """Settings for outlier filtering."""
 
     mode: Literal["disabled", "absolute", "zscore"] = "disabled"
-    """Outlier filter mode.
-    "disabled": No filtering applied.
-    "absolute": Filter by absolute shift threshold in µm.
-    "zscore": Filter by z-score threshold (shift-average_shift/standard_deviation).
-        A value of 2-3 is typical."""
+    """Outlier detection method. 'absolute': threshold in um; 'zscore': z-score
+    threshold (2-3 is typical)."""
     threshold: float | None = None
-    """Either absolute shift threshold in µm or z-score threshold. Tiles with shifts
-    above the threshold will be filtered out and their transformations will be replaced
-    by the mean of the non-outlier shifts. Must be set if mode is not "disabled"."""
+    """Threshold value (um for 'absolute', z-score for 'zscore'). Required unless
+    mode is 'disabled'."""
 
     @model_validator(mode="after")
     def _check_threshold(self) -> "OutlierFilterModel":
@@ -51,7 +47,7 @@ class AcquisitionsSelectionModel(BaseModel):
 
     @model_validator(mode="after")
     def check_acquisitions_empty_when_use_all(self) -> "AcquisitionsSelectionModel":
-        """Validate that acquisitions list is empty when use_all_acquisitions is True."""
+        """Validate acquisitions list is empty when use_all_acquisitions is True."""
         if self.use_all_acquisitions and self.acquisitions:
             raise ValueError(
                 "`acquisitions` must be empty when `use_all_acquisitions` is True."

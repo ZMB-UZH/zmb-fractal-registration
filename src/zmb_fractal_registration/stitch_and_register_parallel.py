@@ -142,7 +142,9 @@ def _get_origin_of_sim(sim, transform_key: str | None = None) -> dict[str, float
     origin = np.array([origin[dim] for dim in get_spatial_dims_from_sim(sim)])
 
     if transform_key is not None:
-        affine = _xaffine_to_matrix(get_affine_from_sim(sim, transform_key=transform_key))
+        affine = _xaffine_to_matrix(
+            get_affine_from_sim(sim, transform_key=transform_key)
+        )
         origin = np.concatenate([origin, np.ones(1)])
         origin = np.matmul(affine, origin)[:ndim]
 
@@ -164,7 +166,9 @@ def _get_antipode_of_sim(sim, transform_key: str | None = None) -> dict[str, flo
     )
 
     if transform_key is not None:
-        affine = _xaffine_to_matrix(get_affine_from_sim(sim, transform_key=transform_key))
+        affine = _xaffine_to_matrix(
+            get_affine_from_sim(sim, transform_key=transform_key)
+        )
         antipode = np.concatenate([antipode, np.ones(1)])
         antipode = np.matmul(affine, antipode)[:ndim]
 
@@ -189,7 +193,9 @@ def _fuse_masked(sims: list):
     "fractal_input" transform alias pointing to "affine_registered".
     """
     # TODO: optimize chunksize
-    sim_fused = fusion.fuse(sims, transform_key="affine_registered", output_chunksize=1024)
+    sim_fused = fusion.fuse(
+        sims, transform_key="affine_registered", output_chunksize=1024
+    )
     mask = fusion.fuse(
         [xr.ones_like(s) for s in sims],
         transform_key="affine_registered",
@@ -230,9 +236,7 @@ def _has_overlap_with_reference_tiles(
     sim = msi_utils.get_sim_from_msim(msim)
     nsdims = si_utils.get_nonspatial_dims_from_sim(sim)
     if nsdims:
-        sim = si_utils.sim_sel_coords(
-            sim, {nd: sim.coords[nd][0] for nd in nsdims}
-        )
+        sim = si_utils.sim_sel_coords(sim, {nd: sim.coords[nd][0] for nd in nsdims})
     tile_sp = si_utils.get_stack_properties_from_sim(sim, transform_key=transform_key)
 
     for ref_msim in ref_msims:
@@ -309,7 +313,9 @@ def _collect_shifts(msims: list, no_overlap_set: set) -> tuple[list[int], list]:
             continue
         sim = msi_utils.get_sim_from_msim(msim)
         t_reg = param_utils.translation_from_affine(
-            _xaffine_to_matrix(get_affine_from_sim(sim, transform_key="affine_registered"))
+            _xaffine_to_matrix(
+                get_affine_from_sim(sim, transform_key="affine_registered")
+            )
         )
         t_in = param_utils.translation_from_affine(
             _xaffine_to_matrix(get_affine_from_sim(sim, transform_key="fractal_input"))
@@ -334,9 +340,7 @@ def _detect_outlier_tiles(
         return set()
 
     initial_mean = np.mean(shifts, axis=0)
-    deviations = np.array(
-        [float(np.linalg.norm(s - initial_mean)) for s in shifts]
-    )
+    deviations = np.array([float(np.linalg.norm(s - initial_mean)) for s in shifts])
 
     if osc.mode == "zscore":
         mean_dev = float(np.mean(deviations))
@@ -350,7 +354,7 @@ def _detect_outlier_tiles(
         score_label, scores = "z-score", zscores
     else:
         is_outlier = deviations > osc.threshold
-        score_label, scores = "deviation (µm)", deviations
+        score_label, scores = "deviation (um)", deviations
 
     outlier_tile_indices: set[int] = set()
     for list_idx, tile_idx in enumerate(reg_tile_indices):
@@ -398,7 +402,9 @@ def _register_leftover_tiles(
         for tile_idx in sorted(tiles_to_correct):
             msim = msims[tile_idx]
             sim = msi_utils.get_sim_from_msim(msim)
-            matrix = _xaffine_to_matrix(get_affine_from_sim(sim, transform_key="fractal_input"))
+            matrix = _xaffine_to_matrix(
+                get_affine_from_sim(sim, transform_key="fractal_input")
+            )
             xaffine = param_utils.affine_to_xaffine(matrix, t_coords=[0])
             msi_utils.set_affine_transform(msim, xaffine, "affine_registered")
         return
@@ -413,8 +419,8 @@ def _register_leftover_tiles(
 
     sorted_tile_indices = sorted(tiles_to_correct)
     logger.info(
-        f"  Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover tile(s) "
-        f"against fused inlier image."
+        f"  Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover "
+        f"tile(s) against fused inlier image."
     )
     try:
         registration.register(
@@ -486,8 +492,12 @@ def stitch_and_register_parallel(
             )
 
     reg_image_ref = containers[ref_cycle].get_image(path=str(init_args.pyramid_level))
-    reg_channel = _resolve_registration_channel(reg_image_ref, init_args.reference_channel)
-    logger.info(f"Reference cycle: '{ref_cycle}', registration channel: '{reg_channel}'")
+    reg_channel = _resolve_registration_channel(
+        reg_image_ref, init_args.reference_channel
+    )
+    logger.info(
+        f"Reference cycle: '{ref_cycle}', registration channel: '{reg_channel}'"
+    )
 
     # ------------------------------------------------------------------
     # Step 1: Load all FOVs from each cycle at the registration pyramid
@@ -552,7 +562,9 @@ def stitch_and_register_parallel(
     if osc.mode == "zscore":
         logger.info(f"Outlier detection enabled (z-score threshold: {osc.threshold}).")
     elif osc.mode != "disabled":
-        logger.info(f"Outlier detection enabled (absolute threshold: {osc.threshold} µm).")
+        logger.info(
+            f"Outlier detection enabled (absolute threshold: {osc.threshold} um)."
+        )
 
     for cycle in cycles:
         if cycle == ref_cycle:
@@ -577,14 +589,18 @@ def stitch_and_register_parallel(
             z_project=False,
             channel_suffix=f"_{cycle}",
         )
-        for msim_reg, msim_fus in zip(msims_reg[cycle], msims_fusion[cycle], strict=True):
+        for msim_reg, msim_fus in zip(
+            msims_reg[cycle], msims_fusion[cycle], strict=True
+        ):
             affine = msi_utils.get_transform_from_msim(msim_reg, "affine_registered")
             if z_project:
                 affine_3d = param_utils.identity_transform(
                     ndim=3,
                     t_coords=affine.coords["t"] if "t" in affine.dims else None,
                 )
-                affine_3d.loc[{pdim: affine.coords[pdim] for pdim in affine.dims}] = affine
+                affine_3d.loc[{pdim: affine.coords[pdim] for pdim in affine.dims}] = (
+                    affine
+                )
                 affine = affine_3d
             msi_utils.set_affine_transform(msim_fus, affine, "affine_registered")
 
@@ -597,15 +613,17 @@ def stitch_and_register_parallel(
     for cycle in cycles:
         for msim in msims_fusion[cycle]:
             sim = msi_utils.get_sim_from_msim(msim)
-            origins_all.append(_get_origin_of_sim(sim, transform_key="affine_registered"))
-            antipodes_all.append(_get_antipode_of_sim(sim, transform_key="affine_registered"))
+            origins_all.append(
+                _get_origin_of_sim(sim, transform_key="affine_registered")
+            )
+            antipodes_all.append(
+                _get_antipode_of_sim(sim, transform_key="affine_registered")
+            )
 
     spacing_ref = get_spacing_from_sim(
         msi_utils.get_sim_from_msim(msims_fusion[ref_cycle][0]), asarray=False
     )
-    global_origin = {
-        dim: min(o[dim] for o in origins_all) for dim in origins_all[0]
-    }
+    global_origin = {dim: min(o[dim] for o in origins_all) for dim in origins_all[0]}
     global_shape = {
         dim: int(
             np.ceil(

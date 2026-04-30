@@ -248,10 +248,10 @@ def test_detect_outlier_tiles_zscore():
 
 
 def test_detect_outlier_tiles_absolute():
-    """Absolute mode flags a tile whose shift exceeds the threshold in µm."""
+    """Absolute mode flags a tile whose shift exceeds the threshold in um."""
     # Deviations are computed from the mean, not from zero.
     # With 4 inliers at [1,0] and 1 outlier at [100,0], mean=[20.8,0],
-    # inlier deviation≈19.8 µm and outlier deviation≈79.2 µm.
+    # inlier deviation~19.8 um and outlier deviation~79.2 um.
     # Use threshold=50 to flag only the outlier.
     shifts = [np.array([1.0, 0.0])] * 4 + [np.array([100.0, 0.0])]
     reg_tile_indices = list(range(5))
