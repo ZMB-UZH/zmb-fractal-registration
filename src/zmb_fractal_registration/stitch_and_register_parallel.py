@@ -398,8 +398,9 @@ def _register_leftover_tiles(
         for tile_idx in sorted(tiles_to_correct):
             msim = msims[tile_idx]
             sim = msi_utils.get_sim_from_msim(msim)
-            affine = get_affine_from_sim(sim, transform_key="fractal_input")
-            msi_utils.set_affine_transform(msim, affine, "affine_registered")
+            matrix = _xaffine_to_matrix(get_affine_from_sim(sim, transform_key="fractal_input"))
+            xaffine = param_utils.affine_to_xaffine(matrix, t_coords=[0])
+            msi_utils.set_affine_transform(msim, xaffine, "affine_registered")
         return
 
     logger.info(
@@ -410,13 +411,15 @@ def _register_leftover_tiles(
         [msi_utils.get_sim_from_msim(msims[i]) for i in ok_indices]
     )
 
-    delayed_tasks = []
-    for tile_idx in sorted(tiles_to_correct):
-        logger.info(
-            f"  Cycle '{cycle}', tile {tile_idx}: re-registering against fused inlier image."
-        )
-        task = delayed(registration.register)(
-            [msi_utils.get_msim_from_sim(sim_fused_inliers), msims[tile_idx]],
+    sorted_tile_indices = sorted(tiles_to_correct)
+    logger.info(
+        f"  Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover tile(s) "
+        f"against fused inlier image."
+    )
+    try:
+        registration.register(
+            [msi_utils.get_msim_from_sim(sim_fused_inliers)]
+            + [msims[i] for i in sorted_tile_indices],
             reg_channel=reg_channel,
             transform_key="fractal_input",
             new_transform_key="affine_registered",
@@ -424,8 +427,19 @@ def _register_leftover_tiles(
             groupwise_resolution_kwargs={"reference_view": 0},
             reg_res_level=0,
         )
-        delayed_tasks.append(task)
-    compute(*delayed_tasks)
+    except mv_graph.NotEnoughOverlapError:
+        logger.warning(
+            f"  Cycle '{cycle}': leftover tile registration failed (not enough overlap "
+            f"with fused inlier); all leftover tiles will keep their stage position."
+        )
+        for tile_idx in sorted_tile_indices:
+            msim = msims[tile_idx]
+            sim = msi_utils.get_sim_from_msim(msim)
+            matrix = _xaffine_to_matrix(
+                get_affine_from_sim(sim, transform_key="fractal_input")
+            )
+            xaffine = param_utils.affine_to_xaffine(matrix, t_coords=[0])
+            msi_utils.set_affine_transform(msim, xaffine, "affine_registered")
 
 
 @validate_call
