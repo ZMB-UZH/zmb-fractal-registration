@@ -379,15 +379,14 @@ def _register_leftover_tiles(
     """Re-register outlier and no-overlap tiles against the fused inlier image.
 
     Inlier tiles (all tiles not in tiles_to_correct) are fused into a single
-    reference image. Each leftover tile is then registered against this fused
-    inlier, starting from its stage position (fractal_input), with the fused
-    inlier held fixed.
+    reference image. Each leftover tile is registered against this fused inlier
+    with the inlier held fixed. Registration is seeded from the tile's stage
+    position shifted by the mean (registered - stage) translation of all inlier
+    tiles, which provides a better starting point than raw stage positions alone.
 
-    For both no-overlap tiles (affine_registered never set) and outlier tiles
-    (affine_registered unreliable), fractal_input is used as the starting
-    transform so the registration is seeded from the stage position.
-
-    Falls back to the stage position if there are no inlier tiles to fuse.
+    Falls back to stage position + mean inlier shift (no registration) if there
+    is no spatial overlap with the fused inlier. Falls back to the raw stage
+    position if there are no inlier tiles at all.
     """
     if not tiles_to_correct:
         return
@@ -417,17 +416,63 @@ def _register_leftover_tiles(
         [msi_utils.get_sim_from_msim(msims[i]) for i in ok_indices]
     )
 
+    # Compute mean (registered - stage) shift across inlier tiles and use
+    # stage + mean_shift as the starting transform for leftover tiles.
+    inlier_shifts = []
+    for i in ok_indices:
+        sim_i = msi_utils.get_sim_from_msim(msims[i])
+        t_reg = param_utils.translation_from_affine(
+            _xaffine_to_matrix(
+                get_affine_from_sim(sim_i, transform_key="affine_registered")
+            )
+        )
+        t_in = param_utils.translation_from_affine(
+            _xaffine_to_matrix(
+                get_affine_from_sim(sim_i, transform_key="fractal_input")
+            )
+        )
+        inlier_shifts.append(t_reg - t_in)
+    mean_shift = np.mean(inlier_shifts, axis=0)
+    ndim = len(mean_shift)
+    logger.debug(
+        f"  Cycle '{cycle}': mean inlier shift used to seed leftover tiles: "
+        f"{np.round(mean_shift, 3)}"
+    )
+
+    _INIT_KEY = "fractal_input_mean_shifted"
     sorted_tile_indices = sorted(tiles_to_correct)
+    for tile_idx in sorted_tile_indices:
+        sim_tile = msi_utils.get_sim_from_msim(msims[tile_idx])
+        t_in = param_utils.translation_from_affine(
+            _xaffine_to_matrix(
+                get_affine_from_sim(sim_tile, transform_key="fractal_input")
+            )
+        )
+        start_matrix = np.eye(ndim + 1)
+        start_matrix[:ndim, ndim] = t_in + mean_shift
+        msi_utils.set_affine_transform(
+            msims[tile_idx],
+            param_utils.affine_to_xaffine(start_matrix, t_coords=[0]),
+            _INIT_KEY,
+        )
+
+    # Alias the fused inlier's position under the shared init key.
+    msim_fused_inliers = msi_utils.get_msim_from_sim(sim_fused_inliers)
+    msi_utils.set_affine_transform(
+        msim_fused_inliers,
+        msi_utils.get_transform_from_msim(msim_fused_inliers, "fractal_input"),
+        _INIT_KEY,
+    )
+
     logger.info(
         f"  Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover "
         f"tile(s) against fused inlier image."
     )
     try:
         registration.register(
-            [msi_utils.get_msim_from_sim(sim_fused_inliers)]
-            + [msims[i] for i in sorted_tile_indices],
+            [msim_fused_inliers] + [msims[i] for i in sorted_tile_indices],
             reg_channel=reg_channel,
-            transform_key="fractal_input",
+            transform_key=_INIT_KEY,
             new_transform_key="affine_registered",
             pre_registration_pruning_method=None,
             groupwise_resolution_kwargs={"reference_view": 0},
@@ -436,16 +481,11 @@ def _register_leftover_tiles(
     except mv_graph.NotEnoughOverlapError:
         logger.warning(
             f"  Cycle '{cycle}': leftover tile registration failed (not enough overlap "
-            f"with fused inlier); all leftover tiles will keep their stage position."
+            f"with fused inlier); all leftover tiles will use mean inlier shift."
         )
         for tile_idx in sorted_tile_indices:
-            msim = msims[tile_idx]
-            sim = msi_utils.get_sim_from_msim(msim)
-            matrix = _xaffine_to_matrix(
-                get_affine_from_sim(sim, transform_key="fractal_input")
-            )
-            xaffine = param_utils.affine_to_xaffine(matrix, t_coords=[0])
-            msi_utils.set_affine_transform(msim, xaffine, "affine_registered")
+            xaffine = msi_utils.get_transform_from_msim(msims[tile_idx], _INIT_KEY)
+            msi_utils.set_affine_transform(msims[tile_idx], xaffine, "affine_registered")
 
 
 @validate_call
