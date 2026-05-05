@@ -99,10 +99,20 @@
             "title": "ChannelSelectionModel",
             "type": "object"
           },
-          "OutlierFilterModel": {
-            "description": "Settings for outlier filtering.",
+          "TileCorrectionModel": {
+            "description": "Settings for correcting non-overlapping tiles and filtering outliers.",
             "properties": {
-              "mode": {
+              "correction_method": {
+                "default": "reregister",
+                "description": "How to correct leftover tiles (outliers and non-overlapping tiles).\n'reregister': re-stitch leftover tiles against fixed inlier tiles.\n'mean_shift': apply the mean (registered - stage) shift of the inlier tiles\ndirectly, without re-registration.",
+                "enum": [
+                  "reregister",
+                  "mean_shift"
+                ],
+                "title": "Correction Method",
+                "type": "string"
+              },
+              "outlier_filter_mode": {
                 "default": "disabled",
                 "description": "Outlier detection method. 'absolute': threshold in um; 'zscore': z-score\nthreshold (2-3 is typical).",
                 "enum": [
@@ -110,16 +120,16 @@
                   "absolute",
                   "zscore"
                 ],
-                "title": "Mode",
+                "title": "Outlier Filter Mode",
                 "type": "string"
               },
               "threshold": {
-                "description": "Threshold value (um for 'absolute', z-score for 'zscore'). Required unless\nmode is 'disabled'.",
+                "description": "Threshold value (um for 'absolute', z-score for 'zscore'). Required\nunless mode is 'disabled'.",
                 "title": "Threshold",
                 "type": "number"
               }
             },
-            "title": "OutlierFilterModel",
+            "title": "TileCorrectionModel",
             "type": "object"
           }
         },
@@ -177,14 +187,15 @@
             "type": "boolean",
             "description": "If True, calculate stitching/registration on a z-projection and apply the calculated transformations to the full 3D image. If False, operate on the full image volume. Only used in case of 3D images."
           },
-          "outlier_filter": {
-            "$ref": "#/$defs/OutlierFilterModel",
+          "tile_correction": {
+            "$ref": "#/$defs/TileCorrectionModel",
             "default": {
-              "mode": "disabled",
+              "correction_method": "reregister",
+              "outlier_filter_mode": "disabled",
               "threshold": null
             },
-            "title": "Outlier Filter",
-            "description": "Settings for filtering out large shifts during registration."
+            "title": "Tile Correction",
+            "description": "Settings for correcting non-overlapping tiles and filtering outliers."
           },
           "keep_original_acquisitions": {
             "default": true,
@@ -269,9 +280,10 @@
                 "type": "boolean"
               },
               "outlier_filter": {
-                "$ref": "#/$defs/OutlierFilterModel",
+                "$ref": "#/$defs/TileCorrectionModel",
                 "default": {
-                  "mode": "disabled",
+                  "correction_method": "reregister",
+                  "outlier_filter_mode": "disabled",
                   "threshold": null
                 },
                 "title": "Outlier_Filter"
@@ -286,10 +298,20 @@
             "title": "InitArgsStitchAndRegisterParallel",
             "type": "object"
           },
-          "OutlierFilterModel": {
-            "description": "Settings for outlier filtering.",
+          "TileCorrectionModel": {
+            "description": "Settings for correcting non-overlapping tiles and filtering outliers.",
             "properties": {
-              "mode": {
+              "correction_method": {
+                "default": "reregister",
+                "description": "How to correct leftover tiles (outliers and non-overlapping tiles).\n'reregister': re-stitch leftover tiles against fixed inlier tiles.\n'mean_shift': apply the mean (registered - stage) shift of the inlier tiles\ndirectly, without re-registration.",
+                "enum": [
+                  "reregister",
+                  "mean_shift"
+                ],
+                "title": "Correction Method",
+                "type": "string"
+              },
+              "outlier_filter_mode": {
                 "default": "disabled",
                 "description": "Outlier detection method. 'absolute': threshold in um; 'zscore': z-score\nthreshold (2-3 is typical).",
                 "enum": [
@@ -297,16 +319,16 @@
                   "absolute",
                   "zscore"
                 ],
-                "title": "Mode",
+                "title": "Outlier Filter Mode",
                 "type": "string"
               },
               "threshold": {
-                "description": "Threshold value (um for 'absolute', z-score for 'zscore'). Required unless\nmode is 'disabled'.",
+                "description": "Threshold value (um for 'absolute', z-score for 'zscore'). Required\nunless mode is 'disabled'.",
                 "title": "Threshold",
                 "type": "number"
               }
             },
-            "title": "OutlierFilterModel",
+            "title": "TileCorrectionModel",
             "type": "object"
           }
         },

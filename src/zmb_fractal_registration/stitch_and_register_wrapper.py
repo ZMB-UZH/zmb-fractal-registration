@@ -6,7 +6,7 @@ from typing import Optional
 from ngio import ChannelSelectionModel
 
 from zmb_fractal_registration.stitch_and_register_init import (
-    OutlierFilterModel,
+    TileCorrectionModel,
 )
 from zmb_fractal_registration.stitch_and_register_parallel import (
     InitArgsStitchAndRegisterParallel,
@@ -27,7 +27,7 @@ def stitch_and_register(
     cycle_names: Optional[list[str]] = None,
     z_project: bool = True,
     pyramid_level: int = 0,
-    outlier_filter: OutlierFilterModel = OutlierFilterModel(),
+    tile_correction: TileCorrectionModel = TileCorrectionModel(),
     show_logs: bool = False,
     log_level: int = logging.INFO,
 ) -> dict:
@@ -53,8 +53,8 @@ def stitch_and_register(
             intensity Z-projection and apply the transforms to the full 3D
             volume. If False, operate on the full volume directly.
         pyramid_level: Pyramid level used for stitching/registration.
-        outlier_filter: Settings for outlier registration-shift correction.
-            See `OutlierShiftCorrectionModel` for details.
+        tile_correction: Settings for correcting non-overlapping tiles and
+            filtering outliers. See `TileCorrectionModel` for details.
         show_logs: If True, configure root logging so task logs are printed.
         log_level: Logging level used when show_logs is True.
     """
@@ -83,7 +83,7 @@ def stitch_and_register(
         pyramid_level=pyramid_level,
         z_project=z_project,
         keep_original_acquisitions=True,
-        outlier_filter=outlier_filter,
+        tile_correction=tile_correction,
     )
 
     return stitch_and_register_parallel(

@@ -12,7 +12,7 @@ from ngio import (
 from ngio.tables import RoiTable
 
 from zmb_fractal_registration.stitch_and_register_init import (
-    OutlierFilterModel,
+    TileCorrectionModel,
     stitch_and_register_init,
 )
 from zmb_fractal_registration.stitch_and_register_parallel import (
@@ -242,7 +242,7 @@ def test_detect_outlier_tiles_zscore():
     # With 4+1 layout the outlier's z-score is exactly 2.0; use threshold < 2.0.
     shifts = [np.array([1.0, 0.0])] * 4 + [np.array([100.0, 0.0])]
     reg_tile_indices = list(range(5))
-    osc = OutlierFilterModel(mode="zscore", threshold=1.5)
+    osc = TileCorrectionModel(outlier_filter_mode="zscore", threshold=1.5)
     outliers = _detect_outlier_tiles(shifts, reg_tile_indices, osc, "cycle1")
     assert outliers == {4}
 
@@ -255,7 +255,7 @@ def test_detect_outlier_tiles_absolute():
     # Use threshold=50 to flag only the outlier.
     shifts = [np.array([1.0, 0.0])] * 4 + [np.array([100.0, 0.0])]
     reg_tile_indices = list(range(5))
-    osc = OutlierFilterModel(mode="absolute", threshold=50.0)
+    osc = TileCorrectionModel(outlier_filter_mode="absolute", threshold=50.0)
     outliers = _detect_outlier_tiles(shifts, reg_tile_indices, osc, "cycle1")
     assert outliers == {4}
 
@@ -264,14 +264,14 @@ def test_detect_outlier_tiles_disabled():
     """Disabled mode never flags any tile as an outlier."""
     shifts = [np.array([1.0, 0.0])] * 4 + [np.array([100.0, 0.0])]
     reg_tile_indices = list(range(5))
-    osc = OutlierFilterModel(mode="disabled")
+    osc = TileCorrectionModel(outlier_filter_mode="disabled")
     outliers = _detect_outlier_tiles(shifts, reg_tile_indices, osc, "cycle1")
     assert outliers == set()
 
 
 def test_detect_outlier_tiles_empty_shifts():
     """Empty shift list always returns an empty outlier set."""
-    osc = OutlierFilterModel(mode="zscore", threshold=2.0)
+    osc = TileCorrectionModel(outlier_filter_mode="zscore", threshold=2.0)
     assert _detect_outlier_tiles([], [], osc, "cycle1") == set()
 
 

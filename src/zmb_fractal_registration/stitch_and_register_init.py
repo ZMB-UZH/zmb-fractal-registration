@@ -8,20 +8,27 @@ from ngio import ChannelSelectionModel, open_ome_zarr_plate
 from pydantic import BaseModel, model_validator, validate_call
 
 
-class OutlierFilterModel(BaseModel):
-    """Settings for outlier filtering."""
+class TileCorrectionModel(BaseModel):
+    """Settings for correcting non-overlapping tiles and filtering outliers."""
 
-    mode: Literal["disabled", "absolute", "zscore"] = "disabled"
+    correction_method: Literal["reregister", "mean_shift"] = "reregister"
+    """How to correct leftover tiles (outliers and non-overlapping tiles).
+    'reregister': re-stitch leftover tiles against fixed inlier tiles.
+    'mean_shift': apply the mean (registered - stage) shift of the inlier tiles
+    directly, without re-registration."""
+    outlier_filter_mode: Literal["disabled", "absolute", "zscore"] = "disabled"
     """Outlier detection method. 'absolute': threshold in um; 'zscore': z-score
     threshold (2-3 is typical)."""
     threshold: float | None = None
-    """Threshold value (um for 'absolute', z-score for 'zscore'). Required unless
-    mode is 'disabled'."""
+    """Threshold value (um for 'absolute', z-score for 'zscore'). Required
+    unless mode is 'disabled'."""
 
     @model_validator(mode="after")
-    def _check_threshold(self) -> "OutlierFilterModel":
-        if self.mode != "disabled" and self.threshold is None:
-            raise ValueError(f"`threshold` must be set when mode is '{self.mode}'.")
+    def _check_threshold(self) -> "TileCorrectionModel":
+        if self.outlier_filter_mode != "disabled" and self.threshold is None:
+            raise ValueError(
+                f"`threshold` must be set when mode is '{self.outlier_filter_mode}'."
+            )
         return self
 
 
@@ -69,7 +76,7 @@ def stitch_and_register_init(
     ),
     pyramid_level: int = 0,
     z_project: bool = True,
-    outlier_filter: OutlierFilterModel = OutlierFilterModel(),
+    tile_correction: TileCorrectionModel = TileCorrectionModel(),
     keep_original_acquisitions: bool = True,
 ):
     """Stitch and register multiple acquisitions of a plate.
@@ -100,8 +107,8 @@ def stitch_and_register_init(
             and apply the calculated transformations to the full 3D image.
             If False, operate on the full image volume. Only used in case of
             3D images.
-        outlier_filter: Settings for filtering out large shifts during
-            registration.
+        tile_correction: Settings for correcting non-overlapping tiles and
+            filtering outliers.
         keep_original_acquisitions: If True, keep original acquisitions after
             registration. If False, remove them.
     """
@@ -210,7 +217,7 @@ def stitch_and_register_init(
                 "pyramid_level": pyramid_level,
                 "z_project": z_project,
                 "keep_original_acquisitions": keep_original_acquisitions,
-                "outlier_filter": outlier_filter.model_dump(),
+                "tile_correction": tile_correction.model_dump(),
             }
             parallelization_list.append(
                 {
