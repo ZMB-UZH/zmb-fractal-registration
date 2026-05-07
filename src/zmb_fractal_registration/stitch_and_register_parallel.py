@@ -355,7 +355,7 @@ def _detect_outlier_tiles(
     logger.info(
         f"Cycle '{cycle}': mean shift of all registered tiles: "
         f"mean = {np.round(initial_mean, 3)} um, "
-        f"std = {np.round(np.std(initial_deviations), 3)} um"
+        f"std = {np.round(np.std(initial_deviations, axis=0), 3)} um"
     )
 
     score_label = "z-score" if tcm.outlier_filter_mode == "zscore" else "deviation (um)"
