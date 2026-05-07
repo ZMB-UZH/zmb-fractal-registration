@@ -213,7 +213,6 @@ def _stitch_and_fuse_reference(msims_ref: list, reg_channel: str):
     Returns a spatial image (down-sampled, lazy) that covers the full stitched
     FOV and has NaN outside the tile coverage area.
     """
-    logger.debug(f"Stitching {len(msims_ref)} reference tile(s).")
     registration.register(
         msims_ref,
         reg_channel=reg_channel,
@@ -298,11 +297,6 @@ def _register_cycle_tiles(
         delayed_tasks.append(task)
 
     compute(*delayed_tasks)
-    logger.debug(
-        f"Registered {len(delayed_tasks)} tile(s); "
-        f"{len(no_overlap_indices)} had no overlap with the reference"
-        + (f": {no_overlap_indices}." if no_overlap_indices else ".")
-    )
     return no_overlap_indices
 
 
@@ -349,7 +343,7 @@ def _detect_outlier_tiles(
     initial_mean = np.mean(shifts, axis=0)
     deviations = np.array([float(np.linalg.norm(s - initial_mean)) for s in shifts])
 
-    logger.debug(
+    logger.info(
         f"Cycle '{cycle}': mean shift of all registered tiles: "
         f"mean={np.round(initial_mean, 3)}um, std={np.round(np.std(deviations), 3)}um"
     )
@@ -454,9 +448,9 @@ def _register_leftover_tiles(
     mean_shift = np.mean(inlier_shifts, axis=0)
     ndim = len(mean_shift)
     sorted_tile_indices = sorted(tiles_to_correct)
-    logger.debug(
+    logger.info(
         f"Cycle '{cycle}': mean inlier shift for leftover tiles: "
-        f"{np.round(mean_shift, 3)}"
+        f"{np.round(mean_shift, 3)} um"
     )
 
     if correction_method == "mean_shift":

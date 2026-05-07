@@ -279,14 +279,14 @@
                 "title": "Keep Original Acquisitions",
                 "type": "boolean"
               },
-              "outlier_filter": {
+              "tile_correction": {
                 "$ref": "#/$defs/TileCorrectionModel",
                 "default": {
                   "correction_method": "reregister",
                   "outlier_filter_mode": "disabled",
                   "threshold": null
                 },
-                "title": "Outlier_Filter"
+                "title": "Tile_Correction"
               }
             },
             "required": [
