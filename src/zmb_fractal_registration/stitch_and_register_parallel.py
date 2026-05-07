@@ -6,6 +6,7 @@
 # - add option to input different ROI table
 # - handle larger shifts between cycles by performing a pre-registration step
 # - optimize dask parallelization
+# - consolidate outlier detection with multiview-stitcher tolerance?
 
 import logging
 import shutil
