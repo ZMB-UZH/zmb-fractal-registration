@@ -9,6 +9,7 @@
 
 import logging
 import shutil
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -334,37 +335,70 @@ def _detect_outlier_tiles(
 ) -> set[int]:
     """Detect tiles whose registration shift deviates too much from the mean.
 
+    Outlier detection is performed iteratively: after each pass, the inlier
+    mean (and std for zscore mode) are recomputed from the remaining inliers
+    and another pass is run. Iteration stops when no new outliers are found or
+    all tiles are flagged as outliers.
+
     Returns:
         outlier_tile_indices: Set of tile indices flagged as outliers.
     """
     if not shifts or tcm.outlier_filter_mode == "disabled":
         return set()
 
-    initial_mean = np.mean(shifts, axis=0)
-    deviations = np.array([float(np.linalg.norm(s - initial_mean)) for s in shifts])
+    shifts_arr = np.array(shifts)
+    initial_mean = np.mean(shifts_arr, axis=0)
+    initial_deviations = np.array(
+        [float(np.linalg.norm(s - initial_mean)) for s in shifts_arr]
+    )
 
     logger.info(
         f"Cycle '{cycle}': mean shift of all registered tiles: "
-        f"mean={np.round(initial_mean, 3)}um, std={np.round(np.std(deviations), 3)}um"
+        f"mean = {np.round(initial_mean, 3)} um, "
+        f"std = {np.round(np.std(initial_deviations), 3)} um"
     )
 
-    if tcm.outlier_filter_mode == "zscore":
-        mean_dev = float(np.mean(deviations))
-        std_dev = float(np.std(deviations))
-        zscores = (
-            (deviations - mean_dev) / std_dev
-            if std_dev > 0
-            else np.zeros_like(deviations)
+    score_label = "z-score" if tcm.outlier_filter_mode == "zscore" else "deviation (um)"
+    inlier_mask = np.ones(len(shifts), dtype=bool)
+    n_iterations = 0
+    scores = np.zeros(len(shifts))
+
+    while np.any(inlier_mask):
+        n_iterations += 1
+        inlier_mean = np.mean(shifts_arr[inlier_mask], axis=0)
+        deviations = np.array(
+            [float(np.linalg.norm(s - inlier_mean)) for s in shifts_arr]
         )
-        is_outlier = zscores > tcm.threshold
-        score_label, scores = "z-score", zscores
-    else:
-        is_outlier = deviations > tcm.threshold
-        score_label, scores = "deviation (um)", deviations
+        if tcm.outlier_filter_mode == "zscore":
+            inlier_devs = deviations[inlier_mask]
+            mean_dev = float(np.mean(inlier_devs))
+            std_dev = float(np.std(inlier_devs))
+            scores = (
+                (deviations - mean_dev) / std_dev
+                if std_dev > 0
+                else np.zeros_like(deviations)
+            )
+            new_outliers = (scores > tcm.threshold) & inlier_mask
+        else:
+            scores = deviations
+            new_outliers = (deviations > tcm.threshold) & inlier_mask
+
+        if not np.any(new_outliers):
+            break
+
+        inlier_mask[new_outliers] = False
+
+    logger.info(
+        f"Cycle '{cycle}': outlier detection converged after {n_iterations} iterations."
+        f"n_inliers = {np.sum(inlier_mask)}, n_outliers = {np.sum(~inlier_mask)}; "
+        f"Final inlier shifts: "
+        f"mean = {np.round(np.mean(shifts_arr[inlier_mask], axis=0), 3)} um; "
+        f"std = {np.round(np.std(shifts_arr[inlier_mask], axis=0), 3)} um; "
+    )
 
     outlier_tile_indices: set[int] = set()
     for list_idx, tile_idx in enumerate(reg_tile_indices):
-        if is_outlier[list_idx]:
+        if not inlier_mask[list_idx]:
             logger.warning(
                 f"Cycle '{cycle}', tile {tile_idx}: shift "
                 f"{np.round(shifts[list_idx], 3)} um, "
@@ -763,7 +797,10 @@ def stitch_and_register_parallel(
         {
             "zarr_url": zarr_url,
             "origin": init_args.zarr_urls_to_register[0],
-            # TODO: ask Joel how to handle passing the acquisition attribute here
+            "attributes": {
+                "acquisition": Path(zarr_url).as_posix().split("/")[-1],
+            },
+            # TODO: better passing of acquisition metadata (maybe pass from init task)
         }
     ]
 
