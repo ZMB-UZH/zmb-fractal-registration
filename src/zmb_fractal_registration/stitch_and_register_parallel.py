@@ -213,6 +213,7 @@ def _stitch_and_fuse_reference(msims_ref: list, reg_channel: str):
     Returns a spatial image (down-sampled, lazy) that covers the full stitched
     FOV and has NaN outside the tile coverage area.
     """
+    logger.debug(f"Stitching {len(msims_ref)} reference tile(s).")
     registration.register(
         msims_ref,
         reg_channel=reg_channel,
@@ -297,6 +298,11 @@ def _register_cycle_tiles(
         delayed_tasks.append(task)
 
     compute(*delayed_tasks)
+    logger.debug(
+        f"Registered {len(delayed_tasks)} tile(s); "
+        f"{len(no_overlap_indices)} had no overlap with the reference"
+        + (f": {no_overlap_indices}." if no_overlap_indices else ".")
+    )
     return no_overlap_indices
 
 
@@ -343,6 +349,11 @@ def _detect_outlier_tiles(
     initial_mean = np.mean(shifts, axis=0)
     deviations = np.array([float(np.linalg.norm(s - initial_mean)) for s in shifts])
 
+    logger.debug(
+        f"Cycle '{cycle}': mean shift of all registered tiles: "
+        f"mean={np.round(initial_mean, 3)}um, std={np.round(np.std(deviations), 3)}um"
+    )
+
     if tcm.outlier_filter_mode == "zscore":
         mean_dev = float(np.mean(deviations))
         std_dev = float(np.std(deviations))
@@ -361,8 +372,8 @@ def _detect_outlier_tiles(
     for list_idx, tile_idx in enumerate(reg_tile_indices):
         if is_outlier[list_idx]:
             logger.warning(
-                f"  Cycle '{cycle}', tile {tile_idx}: shift "
-                f"{np.round(shifts[list_idx], 3)} "
+                f"Cycle '{cycle}', tile {tile_idx}: shift "
+                f"{np.round(shifts[list_idx], 3)} um, "
                 f"({score_label}={scores[list_idx]:.2f}) "
                 f"flagged as outlier."
             )
@@ -422,8 +433,8 @@ def _register_leftover_tiles(
 
     if not ok_indices:
         logger.warning(
-            f"  Cycle '{cycle}': no inlier tiles available. "
-            f"Leftover tiles will keep their stage position."
+            f"Cycle '{cycle}': no inlier tiles available; "
+            f"leftover tiles will keep their stage position."
         )
         for tile_idx in sorted(tiles_to_correct):
             msim = msims[tile_idx]
@@ -444,13 +455,13 @@ def _register_leftover_tiles(
     ndim = len(mean_shift)
     sorted_tile_indices = sorted(tiles_to_correct)
     logger.debug(
-        f"  Cycle '{cycle}': mean inlier shift for leftover tiles: "
+        f"Cycle '{cycle}': mean inlier shift for leftover tiles: "
         f"{np.round(mean_shift, 3)}"
     )
 
     if correction_method == "mean_shift":
         logger.info(
-            f"  Cycle '{cycle}': applying mean inlier shift to "
+            f"Cycle '{cycle}': applying mean inlier shift to "
             f"{len(sorted_tile_indices)} leftover tile(s) (no re-registration)."
         )
         _apply_mean_shift_to_tiles(msims, sorted_tile_indices, mean_shift, ndim)
@@ -459,7 +470,7 @@ def _register_leftover_tiles(
     # correction_method == "reregister"
     _INIT_KEY = "fractal_input_mean_shifted"
     logger.info(
-        f"  Cycle '{cycle}': fusing {len(ok_indices)} inlier tile(s) as "
+        f"Cycle '{cycle}': fusing {len(ok_indices)} inlier tile(s) as "
         f"reference for re-registration of {len(sorted_tile_indices)} leftover tile(s)."
     )
     sim_fused_inliers = _fuse_masked(
@@ -480,7 +491,7 @@ def _register_leftover_tiles(
     )
 
     logger.info(
-        f"  Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover "
+        f"Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover "
         f"tile(s) against fused inlier image."
     )
     try:
@@ -495,7 +506,7 @@ def _register_leftover_tiles(
         )
     except mv_graph.NotEnoughOverlapError:
         logger.warning(
-            f"  Cycle '{cycle}': leftover tile registration failed (not enough overlap "
+            f"Cycle '{cycle}': leftover tile registration failed (not enough overlap "
             f"with fused inlier); falling back to mean inlier shift."
         )
         _apply_mean_shift_to_tiles(msims, sorted_tile_indices, mean_shift, ndim)
@@ -557,8 +568,8 @@ def stitch_and_register_parallel(
     # level, optionally projecting along z.
     # ------------------------------------------------------------------
     logger.info(
-        f"Loading FOVs at pyramid level {init_args.pyramid_level}"
-        f"{' (z-projected)' if z_project else ''}"
+        f"[Step 1/7] Loading FOVs at pyramid level {init_args.pyramid_level}"
+        f"{' (z-projected)' if z_project else ''}."
     )
     msims_reg = {}
     for cycle in cycles:
@@ -567,43 +578,50 @@ def stitch_and_register_parallel(
         msims_reg[cycle] = _get_msims(
             image=reg_image, fov_roi_table=fov_roi_table, z_project=z_project
         )
-        logger.info(f"  Cycle '{cycle}': loaded {len(msims_reg[cycle])} FOV(s)")
+        logger.info(f"Cycle '{cycle}': loaded {len(msims_reg[cycle])} FOV(s).")
 
     # ------------------------------------------------------------------
     # Step 2: Stitch the reference cycle and fuse into a masked reference
     # image used as the fixed target for per-tile registration.
     # ------------------------------------------------------------------
     logger.info(
-        f"Stitching reference cycle '{ref_cycle}' ({len(msims_reg[ref_cycle])} tiles)"
+        f"[Step 2/7] Stitching reference cycle '{ref_cycle}' "
+        f"({len(msims_reg[ref_cycle])} tile(s))."
     )
     sim_fused_ref_ds = _stitch_and_fuse_reference(msims_reg[ref_cycle], reg_channel)
-    logger.info("  Reference stitching and fusion complete.")
+    logger.info("Reference stitching and fusion complete.")
 
     # ------------------------------------------------------------------
     # Step 3: Register each non-reference cycle's tiles against the fused
     # reference. Tiles without spatial overlap are deferred to Step 4.
     # ------------------------------------------------------------------
     logger.info(
-        f"Registering {len(cycles) - 1} non-reference cycle(s) against fused reference."
+        f"[Step 3/7] Registering {len(cycles) - 1} non-reference cycle(s) "
+        f"against fused reference."
     )
     no_overlap_indices: dict[str, list[int]] = {}
     for cycle in cycles:
         if cycle == ref_cycle:
             continue
-        logger.debug(
-            f"  Queuing {len(msims_reg[cycle])} tile registration task(s) "
-            f"for cycle '{cycle}'"
+        logger.info(
+            f"Cycle '{cycle}': registering {len(msims_reg[cycle])} tile(s) "
+            f"against fused reference."
         )
         no_overlap = _register_cycle_tiles(
             msims_reg[cycle], sim_fused_ref_ds, reg_channel, msims_reg[ref_cycle]
         )
         no_overlap_indices[cycle] = no_overlap
-        if no_overlap:
-            logger.warning(
-                f"  Cycle '{cycle}': {len(no_overlap)} tile(s) had no spatial "
-                f"overlap with the reference and will be re-registered in Step 4."
+        n_reg = len(msims_reg[cycle]) - len(no_overlap)
+        logger.info(
+            f"Cycle '{cycle}': {n_reg} tile(s) registered"
+            + (
+                f"; {len(no_overlap)} had no overlap with the reference "
+                "(deferred to Step 4)."
+                if no_overlap
+                else "."
             )
-    logger.info("  Parallel tile registration complete.")
+        )
+    logger.info("Tile registration complete.")
 
     # ------------------------------------------------------------------
     # Step 4: For each non-reference cycle, detect outlier tiles (shifts
@@ -612,12 +630,13 @@ def stitch_and_register_parallel(
     # the remaining inlier tiles, with the fused inlier held fixed.
     # ------------------------------------------------------------------
     tcm = init_args.tile_correction
-    if tcm.outlier_filter_mode == "zscore":
-        logger.info(f"Outlier detection enabled (z-score threshold: {tcm.threshold}).")
-    elif tcm.outlier_filter_mode != "disabled":
-        logger.info(
-            f"Outlier detection enabled (absolute threshold: {tcm.threshold} um)."
-        )
+    _outlier_desc = tcm.outlier_filter_mode + (
+        f" (threshold={tcm.threshold})" if tcm.outlier_filter_mode != "disabled" else ""
+    )
+    logger.info(
+        f"[Step 4/7] Correcting leftover tiles "
+        f"(outlier detection: {_outlier_desc}, correction: {tcm.correction_method})."
+    )
 
     for cycle in cycles:
         if cycle == ref_cycle:
@@ -626,6 +645,11 @@ def stitch_and_register_parallel(
         reg_tile_indices, shifts = _collect_shifts(msims_reg[cycle], no_overlap_set)
         outlier_indices = _detect_outlier_tiles(shifts, reg_tile_indices, tcm, cycle)
         tiles_to_correct = no_overlap_set | outlier_indices
+        if tiles_to_correct:
+            logger.info(
+                f"Cycle '{cycle}': {len(tiles_to_correct)} leftover tile(s) to correct "
+                f"({len(no_overlap_set)} no-overlap, {len(outlier_indices)} outliers)."
+            )
         _register_leftover_tiles(
             msims_reg[cycle],
             tiles_to_correct,
@@ -638,7 +662,9 @@ def stitch_and_register_parallel(
     # Step 5: Reload FOVs at full resolution and transfer the computed
     # transforms. Expand 2D affines to 3D when z_project was used.
     # ------------------------------------------------------------------
-    logger.info("Reloading FOVs at full resolution and transferring transforms.")
+    logger.info(
+        "[Step 5/7] Reloading FOVs at full resolution and transferring transforms."
+    )
     msims_fusion = {}
     for cycle in cycles:
         fov_roi_table = containers[cycle].get_table("FOV_ROI_table")
@@ -667,7 +693,7 @@ def stitch_and_register_parallel(
     # Step 6: Determine the global bounding box across all cycles and
     # fuse every cycle into a shared output canvas.
     # ------------------------------------------------------------------
-    logger.info("Computing global bounding box and fusing all cycles.")
+    logger.info("[Step 6/7] Computing global bounding box and fusing all cycles.")
     origins_all, antipodes_all = [], []
     for cycle in cycles:
         for msim in msims_fusion[cycle]:
@@ -692,14 +718,12 @@ def stitch_and_register_parallel(
         )
         for dim in global_origin
     }
-    logger.info(
-        f"  Global output shape: {global_shape}, "
-        f"origin: {{k: round(v, 3) for k, v in global_origin.items()}}"
-    )
+    _rounded_origin = {k: round(v, 3) for k, v in global_origin.items()}
+    logger.info(f"Global output shape: {global_shape}, origin: {_rounded_origin}")
 
     sims_fused = {}
     for cycle in cycles:
-        logger.info(f"  Fusing cycle '{cycle}'...")
+        logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
         sims_fused[cycle] = fusion.fuse(
             [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]],
             transform_key="affine_registered",
@@ -718,7 +742,7 @@ def stitch_and_register_parallel(
     # Step 7: Write the fused image to the output OME-Zarr store.
     # ------------------------------------------------------------------
     logger.info(
-        f"Writing fused image to '{zarr_url}' "
+        f"[Step 7/7] Writing fused image to '{zarr_url}' "
         f"(shape: {sim_fused_all.shape}, dims: {sim_fused_all.dims})."
     )
     channels_meta_all = [
@@ -739,7 +763,7 @@ def stitch_and_register_parallel(
     out_image = output_container.get_image()
     out_image.set_array(patch=sim_fused_all.data, axes_order=sim_fused_all.dims)
     out_image.consolidate()
-    logger.info("  Output image written and consolidated successfully.")
+    logger.info("Output image written and consolidated successfully.")
 
     image_list_updates = [
         {
@@ -757,7 +781,7 @@ def stitch_and_register_parallel(
         f"Removing {len(init_args.zarr_urls_to_register)} original acquisition(s)..."
     )
     for url in init_args.zarr_urls_to_register:
-        logger.info(f"  Deleting original acquisition at '{url}'")
+        logger.info(f"Deleting original acquisition at '{url}'.")
         shutil.rmtree(url)
     logger.info("Task complete.")
     return {
