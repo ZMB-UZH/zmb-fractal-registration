@@ -65,7 +65,8 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
             If False, operate on the full image volume.
         keep_original_acquisitions: If True, keep the original acquisitions.
             If False, remove them after processing.
-        outlier_filter: Settings for outlier registration-shift correction.
+        tile_correction: Settings for correcting non-overlapping tiles and
+            filtering outliers.
     """
 
     zarr_urls_to_register: list[str]
@@ -75,7 +76,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
     pyramid_level: int = 0
     z_project: bool = True
     keep_original_acquisitions: bool = True
-    outlier_filter: TileCorrectionModel = TileCorrectionModel()
+    tile_correction: TileCorrectionModel = TileCorrectionModel()
 
 
 def _get_original_translation(roi: Roi, spatial_dims: list[str]) -> dict[str, float]:
@@ -328,7 +329,7 @@ def _collect_shifts(msims: list, no_overlap_set: set) -> tuple[list[int], list]:
 def _detect_outlier_tiles(
     shifts: list,
     reg_tile_indices: list[int],
-    osc: "TileCorrectionModel",
+    tcm: "TileCorrectionModel",
     cycle: str,
 ) -> set[int]:
     """Detect tiles whose registration shift deviates too much from the mean.
@@ -336,13 +337,13 @@ def _detect_outlier_tiles(
     Returns:
         outlier_tile_indices: Set of tile indices flagged as outliers.
     """
-    if not shifts or osc.outlier_filter_mode == "disabled":
+    if not shifts or tcm.outlier_filter_mode == "disabled":
         return set()
 
     initial_mean = np.mean(shifts, axis=0)
     deviations = np.array([float(np.linalg.norm(s - initial_mean)) for s in shifts])
 
-    if osc.outlier_filter_mode == "zscore":
+    if tcm.outlier_filter_mode == "zscore":
         mean_dev = float(np.mean(deviations))
         std_dev = float(np.std(deviations))
         zscores = (
@@ -350,10 +351,10 @@ def _detect_outlier_tiles(
             if std_dev > 0
             else np.zeros_like(deviations)
         )
-        is_outlier = zscores > osc.threshold
+        is_outlier = zscores > tcm.threshold
         score_label, scores = "z-score", zscores
     else:
-        is_outlier = deviations > osc.threshold
+        is_outlier = deviations > tcm.threshold
         score_label, scores = "deviation (um)", deviations
 
     outlier_tile_indices: set[int] = set()
@@ -610,12 +611,12 @@ def stitch_and_register_parallel(
     # tiles. Re-register all such leftover tiles against a fused image of
     # the remaining inlier tiles, with the fused inlier held fixed.
     # ------------------------------------------------------------------
-    osc = init_args.outlier_filter
-    if osc.outlier_filter_mode == "zscore":
-        logger.info(f"Outlier detection enabled (z-score threshold: {osc.threshold}).")
-    elif osc.outlier_filter_mode != "disabled":
+    tcm = init_args.tile_correction
+    if tcm.outlier_filter_mode == "zscore":
+        logger.info(f"Outlier detection enabled (z-score threshold: {tcm.threshold}).")
+    elif tcm.outlier_filter_mode != "disabled":
         logger.info(
-            f"Outlier detection enabled (absolute threshold: {osc.threshold} um)."
+            f"Outlier detection enabled (absolute threshold: {tcm.threshold} um)."
         )
 
     for cycle in cycles:
@@ -623,14 +624,14 @@ def stitch_and_register_parallel(
             continue
         no_overlap_set = set(no_overlap_indices.get(cycle, []))
         reg_tile_indices, shifts = _collect_shifts(msims_reg[cycle], no_overlap_set)
-        outlier_indices = _detect_outlier_tiles(shifts, reg_tile_indices, osc, cycle)
+        outlier_indices = _detect_outlier_tiles(shifts, reg_tile_indices, tcm, cycle)
         tiles_to_correct = no_overlap_set | outlier_indices
         _register_leftover_tiles(
             msims_reg[cycle],
             tiles_to_correct,
             reg_channel,
             cycle,
-            osc.correction_method,
+            tcm.correction_method,
         )
 
     # ------------------------------------------------------------------
