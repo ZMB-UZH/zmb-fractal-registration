@@ -388,12 +388,15 @@ def _detect_outlier_tiles(
 
         inlier_mask[new_outliers] = False
 
+    n_inliers = int(np.sum(inlier_mask))
+    n_outliers = int(np.sum(~inlier_mask))
+    _final_mean = np.round(np.mean(shifts_arr[inlier_mask], axis=0), 3)
+    _final_std = np.round(np.std(shifts_arr[inlier_mask], axis=0), 3)
     logger.info(
-        f"Cycle '{cycle}': outlier detection converged after {n_iterations} iterations."
-        f"n_inliers = {np.sum(inlier_mask)}, n_outliers = {np.sum(~inlier_mask)}; "
-        f"Final inlier shifts: "
-        f"mean = {np.round(np.mean(shifts_arr[inlier_mask], axis=0), 3)} um; "
-        f"std = {np.round(np.std(shifts_arr[inlier_mask], axis=0), 3)} um; "
+        f"Cycle '{cycle}': found {n_outliers} outlier(s) "
+        f"after {n_iterations} iterations. "
+        f"{n_inliers} inlier(s) left. "
+        f"Final inlier shift: mean={_final_mean} um, std={_final_std} um."
     )
 
     outlier_tile_indices: set[int] = set()
