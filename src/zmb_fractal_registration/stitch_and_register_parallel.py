@@ -6,7 +6,6 @@
 # - add option to input different ROI table
 # - handle larger shifts between cycles by performing a pre-registration step
 # - optimize dask parallelization
-# - consolidate outlier detection with multiview-stitcher tolerance?
 
 import logging
 import shutil
@@ -790,6 +789,7 @@ def stitch_and_register_parallel(
         store=zarr_url,
         shape=sim_fused_all.shape,
         channels_meta=channels_meta_all,
+        chunks=tuple(c[0] for c in sim_fused_all.chunks),
         overwrite=True,
     )
     out_image = output_container.get_image()
