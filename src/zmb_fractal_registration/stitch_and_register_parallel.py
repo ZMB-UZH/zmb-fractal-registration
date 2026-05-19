@@ -9,6 +9,7 @@
 
 import logging
 import shutil
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -65,7 +66,8 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
             If False, operate on the full image volume.
         keep_original_acquisitions: If True, keep the original acquisitions.
             If False, remove them after processing.
-        outlier_filter: Settings for outlier registration-shift correction.
+        tile_correction: Settings for correcting non-overlapping tiles and
+            filtering outliers.
     """
 
     zarr_urls_to_register: list[str]
@@ -75,7 +77,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
     pyramid_level: int = 0
     z_project: bool = True
     keep_original_acquisitions: bool = True
-    outlier_filter: TileCorrectionModel = TileCorrectionModel()
+    tile_correction: TileCorrectionModel = TileCorrectionModel()
 
 
 def _get_original_translation(roi: Roi, spatial_dims: list[str]) -> dict[str, float]:
@@ -328,40 +330,81 @@ def _collect_shifts(msims: list, no_overlap_set: set) -> tuple[list[int], list]:
 def _detect_outlier_tiles(
     shifts: list,
     reg_tile_indices: list[int],
-    osc: "TileCorrectionModel",
+    tcm: "TileCorrectionModel",
     cycle: str,
 ) -> set[int]:
     """Detect tiles whose registration shift deviates too much from the mean.
 
+    Outlier detection is performed iteratively: after each pass, the inlier
+    mean (and std for zscore mode) are recomputed from the remaining inliers
+    and another pass is run. Iteration stops when no new outliers are found or
+    all tiles are flagged as outliers.
+
     Returns:
         outlier_tile_indices: Set of tile indices flagged as outliers.
     """
-    if not shifts or osc.outlier_filter_mode == "disabled":
+    if not shifts or tcm.outlier_filter_mode == "disabled":
         return set()
 
-    initial_mean = np.mean(shifts, axis=0)
-    deviations = np.array([float(np.linalg.norm(s - initial_mean)) for s in shifts])
+    shifts_arr = np.array(shifts)
+    initial_mean = np.mean(shifts_arr, axis=0)
+    initial_deviations = np.array(
+        [float(np.linalg.norm(s - initial_mean)) for s in shifts_arr]
+    )
 
-    if osc.outlier_filter_mode == "zscore":
-        mean_dev = float(np.mean(deviations))
-        std_dev = float(np.std(deviations))
-        zscores = (
-            (deviations - mean_dev) / std_dev
-            if std_dev > 0
-            else np.zeros_like(deviations)
+    logger.info(
+        f"Cycle '{cycle}': mean shift of all registered tiles: "
+        f"mean = {np.round(initial_mean, 3)} um, "
+        f"std = {np.round(np.std(initial_deviations, axis=0), 3)} um"
+    )
+
+    score_label = "z-score" if tcm.outlier_filter_mode == "zscore" else "deviation (um)"
+    inlier_mask = np.ones(len(shifts), dtype=bool)
+    n_iterations = 0
+    scores = np.zeros(len(shifts))
+
+    while np.any(inlier_mask):
+        n_iterations += 1
+        inlier_mean = np.mean(shifts_arr[inlier_mask], axis=0)
+        deviations = np.array(
+            [float(np.linalg.norm(s - inlier_mean)) for s in shifts_arr]
         )
-        is_outlier = zscores > osc.threshold
-        score_label, scores = "z-score", zscores
-    else:
-        is_outlier = deviations > osc.threshold
-        score_label, scores = "deviation (um)", deviations
+        if tcm.outlier_filter_mode == "zscore":
+            inlier_devs = deviations[inlier_mask]
+            mean_dev = float(np.mean(inlier_devs))
+            std_dev = float(np.std(inlier_devs))
+            scores = (
+                (deviations - mean_dev) / std_dev
+                if std_dev > 0
+                else np.zeros_like(deviations)
+            )
+            new_outliers = (scores > tcm.threshold) & inlier_mask
+        else:
+            scores = deviations
+            new_outliers = (deviations > tcm.threshold) & inlier_mask
+
+        if not np.any(new_outliers):
+            break
+
+        inlier_mask[new_outliers] = False
+
+    n_inliers = int(np.sum(inlier_mask))
+    n_outliers = int(np.sum(~inlier_mask))
+    _final_mean = np.round(np.mean(shifts_arr[inlier_mask], axis=0), 3)
+    _final_std = np.round(np.std(shifts_arr[inlier_mask], axis=0), 3)
+    logger.info(
+        f"Cycle '{cycle}': found {n_outliers} outlier(s) "
+        f"after {n_iterations} iterations. "
+        f"{n_inliers} inlier(s) left. "
+        f"Final inlier shift: mean={_final_mean} um, std={_final_std} um."
+    )
 
     outlier_tile_indices: set[int] = set()
     for list_idx, tile_idx in enumerate(reg_tile_indices):
-        if is_outlier[list_idx]:
+        if not inlier_mask[list_idx]:
             logger.warning(
-                f"  Cycle '{cycle}', tile {tile_idx}: shift "
-                f"{np.round(shifts[list_idx], 3)} "
+                f"Cycle '{cycle}', tile {tile_idx}: shift "
+                f"{np.round(shifts[list_idx], 3)} um, "
                 f"({score_label}={scores[list_idx]:.2f}) "
                 f"flagged as outlier."
             )
@@ -421,8 +464,8 @@ def _register_leftover_tiles(
 
     if not ok_indices:
         logger.warning(
-            f"  Cycle '{cycle}': no inlier tiles available. "
-            f"Leftover tiles will keep their stage position."
+            f"Cycle '{cycle}': no inlier tiles available; "
+            f"leftover tiles will keep their stage position."
         )
         for tile_idx in sorted(tiles_to_correct):
             msim = msims[tile_idx]
@@ -442,14 +485,14 @@ def _register_leftover_tiles(
     mean_shift = np.mean(inlier_shifts, axis=0)
     ndim = len(mean_shift)
     sorted_tile_indices = sorted(tiles_to_correct)
-    logger.debug(
-        f"  Cycle '{cycle}': mean inlier shift for leftover tiles: "
-        f"{np.round(mean_shift, 3)}"
+    logger.info(
+        f"Cycle '{cycle}': mean inlier shift for leftover tiles: "
+        f"{np.round(mean_shift, 3)} um"
     )
 
     if correction_method == "mean_shift":
         logger.info(
-            f"  Cycle '{cycle}': applying mean inlier shift to "
+            f"Cycle '{cycle}': applying mean inlier shift to "
             f"{len(sorted_tile_indices)} leftover tile(s) (no re-registration)."
         )
         _apply_mean_shift_to_tiles(msims, sorted_tile_indices, mean_shift, ndim)
@@ -458,7 +501,7 @@ def _register_leftover_tiles(
     # correction_method == "reregister"
     _INIT_KEY = "fractal_input_mean_shifted"
     logger.info(
-        f"  Cycle '{cycle}': fusing {len(ok_indices)} inlier tile(s) as "
+        f"Cycle '{cycle}': fusing {len(ok_indices)} inlier tile(s) as "
         f"reference for re-registration of {len(sorted_tile_indices)} leftover tile(s)."
     )
     sim_fused_inliers = _fuse_masked(
@@ -479,7 +522,7 @@ def _register_leftover_tiles(
     )
 
     logger.info(
-        f"  Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover "
+        f"Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover "
         f"tile(s) against fused inlier image."
     )
     try:
@@ -494,7 +537,7 @@ def _register_leftover_tiles(
         )
     except mv_graph.NotEnoughOverlapError:
         logger.warning(
-            f"  Cycle '{cycle}': leftover tile registration failed (not enough overlap "
+            f"Cycle '{cycle}': leftover tile registration failed (not enough overlap "
             f"with fused inlier); falling back to mean inlier shift."
         )
         _apply_mean_shift_to_tiles(msims, sorted_tile_indices, mean_shift, ndim)
@@ -556,8 +599,8 @@ def stitch_and_register_parallel(
     # level, optionally projecting along z.
     # ------------------------------------------------------------------
     logger.info(
-        f"Loading FOVs at pyramid level {init_args.pyramid_level}"
-        f"{' (z-projected)' if z_project else ''}"
+        f"[Step 1/7] Loading FOVs at pyramid level {init_args.pyramid_level}"
+        f"{' (z-projected)' if z_project else ''}."
     )
     msims_reg = {}
     for cycle in cycles:
@@ -566,43 +609,50 @@ def stitch_and_register_parallel(
         msims_reg[cycle] = _get_msims(
             image=reg_image, fov_roi_table=fov_roi_table, z_project=z_project
         )
-        logger.info(f"  Cycle '{cycle}': loaded {len(msims_reg[cycle])} FOV(s)")
+        logger.info(f"Cycle '{cycle}': loaded {len(msims_reg[cycle])} FOV(s).")
 
     # ------------------------------------------------------------------
     # Step 2: Stitch the reference cycle and fuse into a masked reference
     # image used as the fixed target for per-tile registration.
     # ------------------------------------------------------------------
     logger.info(
-        f"Stitching reference cycle '{ref_cycle}' ({len(msims_reg[ref_cycle])} tiles)"
+        f"[Step 2/7] Stitching reference cycle '{ref_cycle}' "
+        f"({len(msims_reg[ref_cycle])} tile(s))."
     )
     sim_fused_ref_ds = _stitch_and_fuse_reference(msims_reg[ref_cycle], reg_channel)
-    logger.info("  Reference stitching and fusion complete.")
+    logger.info("Reference stitching and fusion complete.")
 
     # ------------------------------------------------------------------
     # Step 3: Register each non-reference cycle's tiles against the fused
     # reference. Tiles without spatial overlap are deferred to Step 4.
     # ------------------------------------------------------------------
     logger.info(
-        f"Registering {len(cycles) - 1} non-reference cycle(s) against fused reference."
+        f"[Step 3/7] Registering {len(cycles) - 1} non-reference cycle(s) "
+        f"against fused reference."
     )
     no_overlap_indices: dict[str, list[int]] = {}
     for cycle in cycles:
         if cycle == ref_cycle:
             continue
-        logger.debug(
-            f"  Queuing {len(msims_reg[cycle])} tile registration task(s) "
-            f"for cycle '{cycle}'"
+        logger.info(
+            f"Cycle '{cycle}': registering {len(msims_reg[cycle])} tile(s) "
+            f"against fused reference."
         )
         no_overlap = _register_cycle_tiles(
             msims_reg[cycle], sim_fused_ref_ds, reg_channel, msims_reg[ref_cycle]
         )
         no_overlap_indices[cycle] = no_overlap
-        if no_overlap:
-            logger.warning(
-                f"  Cycle '{cycle}': {len(no_overlap)} tile(s) had no spatial "
-                f"overlap with the reference and will be re-registered in Step 4."
+        n_reg = len(msims_reg[cycle]) - len(no_overlap)
+        logger.info(
+            f"Cycle '{cycle}': {n_reg} tile(s) registered"
+            + (
+                f"; {len(no_overlap)} had no overlap with the reference "
+                "(deferred to Step 4)."
+                if no_overlap
+                else "."
             )
-    logger.info("  Parallel tile registration complete.")
+        )
+    logger.info("Tile registration complete.")
 
     # ------------------------------------------------------------------
     # Step 4: For each non-reference cycle, detect outlier tiles (shifts
@@ -610,34 +660,42 @@ def stitch_and_register_parallel(
     # tiles. Re-register all such leftover tiles against a fused image of
     # the remaining inlier tiles, with the fused inlier held fixed.
     # ------------------------------------------------------------------
-    osc = init_args.outlier_filter
-    if osc.outlier_filter_mode == "zscore":
-        logger.info(f"Outlier detection enabled (z-score threshold: {osc.threshold}).")
-    elif osc.outlier_filter_mode != "disabled":
-        logger.info(
-            f"Outlier detection enabled (absolute threshold: {osc.threshold} um)."
-        )
+    tcm = init_args.tile_correction
+    _outlier_desc = tcm.outlier_filter_mode + (
+        f" (threshold={tcm.threshold})" if tcm.outlier_filter_mode != "disabled" else ""
+    )
+    logger.info(
+        f"[Step 4/7] Correcting leftover tiles "
+        f"(outlier detection: {_outlier_desc}, correction: {tcm.correction_method})."
+    )
 
     for cycle in cycles:
         if cycle == ref_cycle:
             continue
         no_overlap_set = set(no_overlap_indices.get(cycle, []))
         reg_tile_indices, shifts = _collect_shifts(msims_reg[cycle], no_overlap_set)
-        outlier_indices = _detect_outlier_tiles(shifts, reg_tile_indices, osc, cycle)
+        outlier_indices = _detect_outlier_tiles(shifts, reg_tile_indices, tcm, cycle)
         tiles_to_correct = no_overlap_set | outlier_indices
+        if tiles_to_correct:
+            logger.info(
+                f"Cycle '{cycle}': {len(tiles_to_correct)} leftover tile(s) to correct "
+                f"({len(no_overlap_set)} no-overlap, {len(outlier_indices)} outliers)."
+            )
         _register_leftover_tiles(
             msims_reg[cycle],
             tiles_to_correct,
             reg_channel,
             cycle,
-            osc.correction_method,
+            tcm.correction_method,
         )
 
     # ------------------------------------------------------------------
     # Step 5: Reload FOVs at full resolution and transfer the computed
     # transforms. Expand 2D affines to 3D when z_project was used.
     # ------------------------------------------------------------------
-    logger.info("Reloading FOVs at full resolution and transferring transforms.")
+    logger.info(
+        "[Step 5/7] Reloading FOVs at full resolution and transferring transforms."
+    )
     msims_fusion = {}
     for cycle in cycles:
         fov_roi_table = containers[cycle].get_table("FOV_ROI_table")
@@ -666,7 +724,7 @@ def stitch_and_register_parallel(
     # Step 6: Determine the global bounding box across all cycles and
     # fuse every cycle into a shared output canvas.
     # ------------------------------------------------------------------
-    logger.info("Computing global bounding box and fusing all cycles.")
+    logger.info("[Step 6/7] Computing global bounding box and fusing all cycles.")
     origins_all, antipodes_all = [], []
     for cycle in cycles:
         for msim in msims_fusion[cycle]:
@@ -691,14 +749,12 @@ def stitch_and_register_parallel(
         )
         for dim in global_origin
     }
-    logger.info(
-        f"  Global output shape: {global_shape}, "
-        f"origin: {{k: round(v, 3) for k, v in global_origin.items()}}"
-    )
+    _rounded_origin = {k: round(v, 3) for k, v in global_origin.items()}
+    logger.info(f"Global output shape: {global_shape}, origin: {_rounded_origin}")
 
     sims_fused = {}
     for cycle in cycles:
-        logger.info(f"  Fusing cycle '{cycle}'...")
+        logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
         sims_fused[cycle] = fusion.fuse(
             [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]],
             transform_key="affine_registered",
@@ -717,7 +773,7 @@ def stitch_and_register_parallel(
     # Step 7: Write the fused image to the output OME-Zarr store.
     # ------------------------------------------------------------------
     logger.info(
-        f"Writing fused image to '{zarr_url}' "
+        f"[Step 7/7] Writing fused image to '{zarr_url}' "
         f"(shape: {sim_fused_all.shape}, dims: {sim_fused_all.dims})."
     )
     channels_meta_all = [
@@ -733,18 +789,22 @@ def stitch_and_register_parallel(
         store=zarr_url,
         shape=sim_fused_all.shape,
         channels_meta=channels_meta_all,
+        chunks=tuple(c[0] for c in sim_fused_all.chunks),
         overwrite=True,
     )
     out_image = output_container.get_image()
     out_image.set_array(patch=sim_fused_all.data, axes_order=sim_fused_all.dims)
     out_image.consolidate()
-    logger.info("  Output image written and consolidated successfully.")
+    logger.info("Output image written and consolidated successfully.")
 
     image_list_updates = [
         {
             "zarr_url": zarr_url,
             "origin": init_args.zarr_urls_to_register[0],
-            # TODO: ask Joel how to handle passing the acquisition attribute here
+            "attributes": {
+                "acquisition": Path(zarr_url).as_posix().split("/")[-1],
+            },
+            # TODO: better passing of acquisition metadata (maybe pass from init task)
         }
     ]
 
@@ -756,7 +816,7 @@ def stitch_and_register_parallel(
         f"Removing {len(init_args.zarr_urls_to_register)} original acquisition(s)..."
     )
     for url in init_args.zarr_urls_to_register:
-        logger.info(f"  Deleting original acquisition at '{url}'")
+        logger.info(f"Deleting original acquisition at '{url}'.")
         shutil.rmtree(url)
     logger.info("Task complete.")
     return {
