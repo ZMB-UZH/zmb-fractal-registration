@@ -216,13 +216,16 @@ def _create_plate_with_far_tiles(
     return zarr_urls
 
 
-def _run_stitch_and_register(zarr_urls: list[str], zarr_dir: str) -> None:
+def _run_stitch_and_register(
+    zarr_urls: list[str], zarr_dir: str, fusion_region: str = "union"
+) -> None:
     """Run init + parallel stitch-and-register tasks for a list of zarr URLs."""
     ref_channel = ChannelSelectionModel(mode="label", identifier="DAPI")
     result = stitch_and_register_init(
         zarr_urls=zarr_urls,
         zarr_dir=zarr_dir,
         reference_channel=ref_channel,
+        fusion_region=fusion_region,
     )
     for item in result["parallelization_list"]:
         stitch_and_register_parallel(
@@ -293,6 +296,36 @@ def test_non_overlapping_tile(tmp_path: Path):
     fused_image = fused_images[0].get_image()
     assert len(fused_image.channel_labels) == 2
     assert any("DAPI" in label for label in fused_image.channel_labels)
+
+
+def test_fusion_region_intersection(tmp_path: Path):
+    """Intersection fusion completes and is no larger than the union output.
+
+    The two non-ref tiles placed far away mean the non-ref cycle covers a much
+    wider extent than the reference, so the intersection canvas must be strictly
+    smaller than the union canvas along x.
+    """
+    union_path = tmp_path / "union.zarr"
+    union_urls = _create_plate_with_far_tiles(union_path, all_nonref_tiles_far=False)
+    _run_stitch_and_register(union_urls, str(tmp_path), fusion_region="union")
+
+    inter_path = tmp_path / "intersection.zarr"
+    inter_urls = _create_plate_with_far_tiles(inter_path, all_nonref_tiles_far=False)
+    _run_stitch_and_register(inter_urls, str(tmp_path), fusion_region="intersection")
+
+    def _fused_shape(plate_path: Path) -> tuple[int, ...]:
+        plate = open_ome_zarr_plate(plate_path)
+        fused_acq_id = max(plate.acquisition_ids)
+        fused_image = next(
+            iter(plate.get_images(acquisition=fused_acq_id).values())
+        ).get_image()
+        assert len(fused_image.channel_labels) == 2
+        return fused_image.shape
+
+    union_shape = _fused_shape(union_path)
+    inter_shape = _fused_shape(inter_path)
+    # Intersection drops the far tile's exclusive region -> smaller along x.
+    assert inter_shape[-1] < union_shape[-1]
 
 
 def test_all_tiles_non_overlapping_fallback(tmp_path: Path):

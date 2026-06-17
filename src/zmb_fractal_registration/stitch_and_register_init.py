@@ -78,6 +78,7 @@ def stitch_and_register_init(
     z_project: bool = True,
     tile_correction: TileCorrectionModel = TileCorrectionModel(),
     keep_original_acquisitions: bool = True,
+    fusion_region: Literal["union", "intersection"] = "union",
 ):
     """Stitch and register multiple acquisitions of a plate.
 
@@ -111,6 +112,10 @@ def stitch_and_register_init(
             filtering outliers.
         keep_original_acquisitions: If True, keep original acquisitions after
             registration. If False, remove them.
+        fusion_region: Which region of the registered cycles to save.
+            'union': save the full extent covered by any cycle (default).
+            'intersection': save only the region covered by every cycle;
+            pixels outside the per-cycle overlap are set to 0.
     """
     # TODO: Currently, we ignore the zarr_urls, and process all acquisitions found in
     # the plate. -> think about how to filter the acquisitions based on the zarr_urls
@@ -218,6 +223,7 @@ def stitch_and_register_init(
                 "z_project": z_project,
                 "keep_original_acquisitions": keep_original_acquisitions,
                 "tile_correction": tile_correction.model_dump(),
+                "fusion_region": fusion_region,
             }
             parallelization_list.append(
                 {

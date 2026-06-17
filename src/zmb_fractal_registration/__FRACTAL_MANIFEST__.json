@@ -202,6 +202,16 @@
             "title": "Keep Original Acquisitions",
             "type": "boolean",
             "description": "If True, keep original acquisitions after registration. If False, remove them."
+          },
+          "fusion_region": {
+            "default": "union",
+            "enum": [
+              "union",
+              "intersection"
+            ],
+            "title": "Fusion Region",
+            "type": "string",
+            "description": "Which region of the registered cycles to save. 'union': save the full extent covered by any cycle (default). 'intersection': save only the region covered by every cycle; pixels outside the per-cycle overlap are set to 0."
           }
         },
         "required": [
@@ -287,6 +297,15 @@
                   "threshold": null
                 },
                 "title": "Tile_Correction"
+              },
+              "fusion_region": {
+                "default": "union",
+                "enum": [
+                  "union",
+                  "intersection"
+                ],
+                "title": "Fusion Region",
+                "type": "string"
               }
             },
             "required": [

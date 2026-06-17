@@ -10,7 +10,7 @@
 import logging
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import xarray as xr
@@ -68,6 +68,10 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
             If False, remove them after processing.
         tile_correction: Settings for correcting non-overlapping tiles and
             filtering outliers.
+        fusion_region: Which region of the registered cycles to save.
+            'union': save the full extent covered by any cycle (default).
+            'intersection': save only the region covered by every cycle;
+            pixels outside the per-cycle overlap are set to 0.
     """
 
     zarr_urls_to_register: list[str]
@@ -78,6 +82,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
     z_project: bool = True
     keep_original_acquisitions: bool = True
     tile_correction: TileCorrectionModel = TileCorrectionModel()
+    fusion_region: Literal["union", "intersection"] = "union"
 
 
 def _get_original_translation(roi: Roi, spatial_dims: list[str]) -> dict[str, float]:
@@ -543,6 +548,63 @@ def _register_leftover_tiles(
         _apply_mean_shift_to_tiles(msims, sorted_tile_indices, mean_shift, ndim)
 
 
+def _compute_global_bbox(
+    msims_per_cycle: dict[str, list],
+    cycles: list[str],
+    spacing_ref: dict[str, float],
+    fusion_region: str,
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Compute the global output origin and shape across all cycles.
+
+    Each cycle's footprint is bounded by its tiles' transformed origins
+    (lower corner) and antipodes (upper corner). For 'union' the canvas spans
+    every cycle's footprint; for 'intersection' it spans only the rectangle
+    common to all cycles. The 'intersection' canvas always contains the exact
+    per-pixel intersection, which is masked in afterwards.
+
+    Raises:
+        ValueError: If 'intersection' is requested but the cycles share no
+            common overlap region.
+    """
+    per_cycle_origin: dict[str, dict[str, float]] = {}
+    per_cycle_antipode: dict[str, dict[str, float]] = {}
+    for cycle in cycles:
+        origins, antipodes = [], []
+        for msim in msims_per_cycle[cycle]:
+            sim = msi_utils.get_sim_from_msim(msim)
+            origins.append(_get_origin_of_sim(sim, transform_key="affine_registered"))
+            antipodes.append(
+                _get_antipode_of_sim(sim, transform_key="affine_registered")
+            )
+        dims = list(origins[0].keys())
+        per_cycle_origin[cycle] = {d: min(o[d] for o in origins) for d in dims}
+        per_cycle_antipode[cycle] = {d: max(a[d] for a in antipodes) for d in dims}
+
+    dims = list(per_cycle_origin[cycles[0]].keys())
+    if fusion_region == "intersection":
+        global_origin = {d: max(per_cycle_origin[c][d] for c in cycles) for d in dims}
+        global_antipode = {
+            d: min(per_cycle_antipode[c][d] for c in cycles) for d in dims
+        }
+        for d in dims:
+            if global_antipode[d] <= global_origin[d]:
+                raise ValueError(
+                    f"Cycles share no common overlap in dimension '{d}'; cannot "
+                    "fuse with fusion_region='intersection'."
+                )
+    else:
+        global_origin = {d: min(per_cycle_origin[c][d] for c in cycles) for d in dims}
+        global_antipode = {
+            d: max(per_cycle_antipode[c][d] for c in cycles) for d in dims
+        }
+
+    global_shape = {
+        d: int(np.ceil((global_antipode[d] - global_origin[d]) / spacing_ref[d]))
+        for d in dims
+    }
+    return global_origin, global_shape
+
+
 @validate_call
 def stitch_and_register_parallel(
     *,
@@ -724,46 +786,57 @@ def stitch_and_register_parallel(
     # Step 6: Determine the global bounding box across all cycles and
     # fuse every cycle into a shared output canvas.
     # ------------------------------------------------------------------
-    logger.info("[Step 6/7] Computing global bounding box and fusing all cycles.")
-    origins_all, antipodes_all = [], []
-    for cycle in cycles:
-        for msim in msims_fusion[cycle]:
-            sim = msi_utils.get_sim_from_msim(msim)
-            origins_all.append(
-                _get_origin_of_sim(sim, transform_key="affine_registered")
-            )
-            antipodes_all.append(
-                _get_antipode_of_sim(sim, transform_key="affine_registered")
-            )
-
+    fusion_region = init_args.fusion_region
+    logger.info(
+        f"[Step 6/7] Computing global bounding box ({fusion_region}) and "
+        f"fusing all cycles."
+    )
     spacing_ref = get_spacing_from_sim(
         msi_utils.get_sim_from_msim(msims_fusion[ref_cycle][0]), asarray=False
     )
-    global_origin = {dim: min(o[dim] for o in origins_all) for dim in origins_all[0]}
-    global_shape = {
-        dim: int(
-            np.ceil(
-                (max(a[dim] for a in antipodes_all) - global_origin[dim])
-                / spacing_ref[dim]
-            )
-        )
-        for dim in global_origin
-    }
+    global_origin, global_shape = _compute_global_bbox(
+        msims_fusion, cycles, spacing_ref, fusion_region
+    )
     _rounded_origin = {k: round(v, 3) for k, v in global_origin.items()}
     logger.info(f"Global output shape: {global_shape}, origin: {_rounded_origin}")
 
     sims_fused = {}
+    masks_fused = {}
     for cycle in cycles:
         logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
+        cycle_sims = [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
         sims_fused[cycle] = fusion.fuse(
-            [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]],
+            cycle_sims,
             transform_key="affine_registered",
             output_chunksize=1024,
             output_origin=global_origin,
             output_shape=global_shape,
         )
+        if fusion_region == "intersection":
+            masks_fused[cycle] = fusion.fuse(
+                [xr.ones_like(sim) for sim in cycle_sims],
+                transform_key="affine_registered",
+                output_chunksize=1024,
+                output_origin=global_origin,
+                output_shape=global_shape,
+            )
 
     sim_fused_all = xr.concat([sims_fused[cycle] for cycle in cycles], dim="c")
+
+    if fusion_region == "intersection":
+        # Keep only pixels covered by every cycle; zero the rest (preserves dtype).
+        dims_order = sim_fused_all.dims
+        out_dtype = sim_fused_all.dtype
+        coverage = None
+        for cycle in cycles:
+            cov = (masks_fused[cycle] > 0).any(dim="c")
+            coverage = cov if coverage is None else (coverage & cov)
+        sim_fused_all = (
+            xr.where(coverage, sim_fused_all, 0)
+            .astype(out_dtype)
+            .transpose(*dims_order)
+        )
+
     axes_in = containers[ref_cycle].get_image().axes
     sim_fused_all = sim_fused_all.squeeze(
         [dim for dim in sim_fused_all.dims if dim not in axes_in]
