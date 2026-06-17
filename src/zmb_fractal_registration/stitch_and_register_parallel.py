@@ -813,9 +813,13 @@ def stitch_and_register_parallel(
             output_shape=global_shape,
         )
         if fusion_region == "intersection":
+            # Binary coverage mask: max_fusion (np.nanmax) is enough and skips
+            # the costly blending-weight computation that weighted_average does.
+            # Coverage is channel-independent, so fuse a single channel only.
             masks_fused[cycle] = fusion.fuse(
-                [xr.ones_like(sim) for sim in cycle_sims],
+                [xr.ones_like(sim.isel(c=[0])) for sim in cycle_sims],
                 transform_key="affine_registered",
+                fusion_func=fusion.max_fusion,
                 output_chunksize=1024,
                 output_origin=global_origin,
                 output_shape=global_shape,
