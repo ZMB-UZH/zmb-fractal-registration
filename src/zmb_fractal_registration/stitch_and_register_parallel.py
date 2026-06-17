@@ -207,11 +207,16 @@ def _fuse_masked(sims: list):
     sim_fused = fusion.fuse(
         sims, transform_key="affine_registered", output_chunksize=1024
     )
+    # Coverage is channel-independent: fuse a single-channel ones mask with
+    # max_fusion (skips the blending-weight computation), then drop the channel
+    # dim so it broadcasts across all channels of sim_fused.
     mask = fusion.fuse(
-        [xr.ones_like(s) for s in sims],
+        [xr.ones_like(s.isel(c=[0])) for s in sims],
         transform_key="affine_registered",
+        fusion_func=fusion.max_fusion,
         output_chunksize=1024,
     )
+    mask = mask.isel(c=0, drop=True)
     sim_fused = xr.where(mask > 0, sim_fused, np.nan)
     sim_fused.transforms["fractal_input"] = sim_fused.transforms["affine_registered"]
     return sim_fused
