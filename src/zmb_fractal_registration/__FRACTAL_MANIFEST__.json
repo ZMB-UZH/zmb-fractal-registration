@@ -211,7 +211,13 @@
             ],
             "title": "Fusion Region",
             "type": "string",
-            "description": "Which region of the registered cycles to save. 'union': save the full extent covered by any cycle (default). 'intersection': save only the region covered by every cycle; pixels outside the per-cycle overlap are set to 0."
+            "description": "Which region of the registered cycles to save. 'union': save the full extent covered by any cycle (default). 'intersection': save only the region covered by every cycle."
+          },
+          "interpolation_order": {
+            "default": 0,
+            "title": "Interpolation Order",
+            "type": "integer",
+            "description": "Spline interpolation order for resampling tiles into the fused output. 0 (default) is nearest-neighbor (preserves original pixel values), 1 is linear."
           }
         },
         "required": [
@@ -306,6 +312,11 @@
                 ],
                 "title": "Fusion Region",
                 "type": "string"
+              },
+              "interpolation_order": {
+                "default": 0,
+                "title": "Interpolation Order",
+                "type": "integer"
               }
             },
             "required": [

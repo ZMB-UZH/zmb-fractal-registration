@@ -72,6 +72,9 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
             'union': save the full extent covered by any cycle (default).
             'intersection': save only the region covered by every cycle;
             pixels outside the per-cycle overlap are set to 0.
+        interpolation_order: Spline interpolation order for resampling tiles
+            into the fused output. 0 (default) is nearest-neighbor (preserves
+            original pixel values), 1 is linear.
     """
 
     zarr_urls_to_register: list[str]
@@ -83,6 +86,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
     keep_original_acquisitions: bool = True
     tile_correction: TileCorrectionModel = TileCorrectionModel()
     fusion_region: Literal["union", "intersection"] = "union"
+    interpolation_order: int = 0
 
 
 def _get_original_translation(roi: Roi, spatial_dims: list[str]) -> dict[str, float]:
@@ -787,9 +791,10 @@ def stitch_and_register_parallel(
     # fuse every cycle into a shared output canvas.
     # ------------------------------------------------------------------
     fusion_region = init_args.fusion_region
+    interpolation_order = init_args.interpolation_order
     logger.info(
         f"[Step 6/7] Computing global bounding box ({fusion_region}) and "
-        f"fusing all cycles."
+        f"fusing all cycles (interpolation_order={interpolation_order})."
     )
     spacing_ref = get_spacing_from_sim(
         msi_utils.get_sim_from_msim(msims_fusion[ref_cycle][0]), asarray=False
@@ -808,18 +813,18 @@ def stitch_and_register_parallel(
         sims_fused[cycle] = fusion.fuse(
             cycle_sims,
             transform_key="affine_registered",
+            interpolation_order=interpolation_order,
             output_chunksize=1024,
             output_origin=global_origin,
             output_shape=global_shape,
         )
         if fusion_region == "intersection":
-            # Binary coverage mask: max_fusion (np.nanmax) is enough and skips
-            # the costly blending-weight computation that weighted_average does.
             # Coverage is channel-independent, so fuse a single channel only.
             masks_fused[cycle] = fusion.fuse(
                 [xr.ones_like(sim.isel(c=[0])) for sim in cycle_sims],
                 transform_key="affine_registered",
                 fusion_func=fusion.max_fusion,
+                interpolation_order=interpolation_order,
                 output_chunksize=1024,
                 output_origin=global_origin,
                 output_shape=global_shape,
