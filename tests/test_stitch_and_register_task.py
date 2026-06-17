@@ -11,15 +11,19 @@ from ngio import (
 )
 from ngio.tables import RoiTable
 
+from zmb_fractal_registration._stitch_register.output_bbox import (
+    _coverage_cell_grid,
+    _largest_covered_box,
+    _tight_covered_box,
+)
+from zmb_fractal_registration._stitch_register.registration import (
+    _detect_outlier_tiles,
+)
 from zmb_fractal_registration.stitch_and_register_init import (
     TileCorrectionModel,
     stitch_and_register_init,
 )
 from zmb_fractal_registration.stitch_and_register_parallel import (
-    _coverage_cell_grid,
-    _detect_outlier_tiles,
-    _largest_covered_box,
-    _tight_covered_box,
     stitch_and_register_parallel,
 )
 
