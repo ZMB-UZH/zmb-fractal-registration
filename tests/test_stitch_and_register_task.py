@@ -16,7 +16,10 @@ from zmb_fractal_registration.stitch_and_register_init import (
     stitch_and_register_init,
 )
 from zmb_fractal_registration.stitch_and_register_parallel import (
+    _coverage_cell_grid,
     _detect_outlier_tiles,
+    _largest_covered_box,
+    _tight_covered_box,
     stitch_and_register_parallel,
 )
 
@@ -279,6 +282,84 @@ def test_detect_outlier_tiles_empty_shifts():
 
 
 # ---------------------------------------------------------------------------
+# Unit tests for the coordinate-compression bounding-box helpers
+# ---------------------------------------------------------------------------
+
+
+def _rect(y0, y1, x0, x1, z0=None, z1=None):
+    """Build a (origin, antipode) tile rectangle dict pair."""
+    origin = {"y": float(y0), "x": float(x0)}
+    antipode = {"y": float(y1), "x": float(x1)}
+    if z0 is not None:
+        origin["z"] = float(z0)
+        antipode["z"] = float(z1)
+    return origin, antipode
+
+
+def test_coverage_grid_full_overlap():
+    """Two identical full grids -> every cell covered; tight box == bbox."""
+    grid = [_rect(0, 1, 0, 1), _rect(0, 1, 1, 2), _rect(1, 2, 0, 1), _rect(1, 2, 1, 2)]
+    rects = {"A": grid, "B": grid}
+    dims = ["y", "x"]
+    breaks, covered = _coverage_cell_grid(rects, ["A", "B"], dims)
+    assert covered.all()
+    tight_o, tight_a = _tight_covered_box(breaks, covered, dims)
+    bbox_o, bbox_a = _largest_covered_box(breaks, covered, dims)
+    assert (tight_o, tight_a) == ({"y": 0.0, "x": 0.0}, {"y": 2.0, "x": 2.0})
+    assert (bbox_o, bbox_a) == (tight_o, tight_a)
+
+
+def test_coverage_grid_missing_tile_differs():
+    """A hole makes intersection (tight box) larger than intersection_bbox."""
+    full = [_rect(0, 1, 0, 1), _rect(0, 1, 1, 2), _rect(1, 2, 0, 1), _rect(1, 2, 1, 2)]
+    hole = [
+        _rect(0, 1, 0, 1),
+        _rect(0, 1, 1, 2),
+        _rect(1, 2, 0, 1),
+    ]  # missing (1-2,1-2)
+    rects = {"A": full, "B": hole}
+    dims = ["y", "x"]
+    breaks, covered = _coverage_cell_grid(rects, ["A", "B"], dims)
+    # Only the (1,1) cell is uncovered.
+    assert covered.sum() == 3
+    assert not covered[1, 1]
+
+    tight_o, tight_a = _tight_covered_box(breaks, covered, dims)
+    bbox_o, bbox_a = _largest_covered_box(breaks, covered, dims)
+
+    # Tight box still spans the whole 2x2 (it encloses the hole).
+    assert (tight_o, tight_a) == ({"y": 0.0, "x": 0.0}, {"y": 2.0, "x": 2.0})
+    tight_vol = (tight_a["y"] - tight_o["y"]) * (tight_a["x"] - tight_o["x"])
+    bbox_vol = (bbox_a["y"] - bbox_o["y"]) * (bbox_a["x"] - bbox_o["x"])
+    assert bbox_vol == 2.0  # a 1x2 strip avoiding the hole
+    assert bbox_vol < tight_vol
+
+
+def test_largest_covered_box_3d():
+    """3D path: hole in xy, full z range -> bbox keeps full z, avoids the hole."""
+    full = [
+        _rect(0, 1, 0, 1, 0, 1),
+        _rect(0, 1, 1, 2, 0, 1),
+        _rect(1, 2, 0, 1, 0, 1),
+        _rect(1, 2, 1, 2, 0, 1),
+    ]
+    hole = full[:3]  # missing (y1-2, x1-2)
+    rects = {"A": full, "B": hole}
+    dims = ["z", "y", "x"]
+    breaks, covered = _coverage_cell_grid(rects, ["A", "B"], dims)
+    assert covered.shape == (1, 2, 2)
+    bbox_o, bbox_a = _largest_covered_box(breaks, covered, dims)
+    # Full z, and a 1x2 xy strip (volume 2).
+    assert bbox_a["z"] - bbox_o["z"] == 1.0
+    vol = (
+        (bbox_a["z"] - bbox_o["z"])
+        * (bbox_a["y"] - bbox_o["y"])
+        * (bbox_a["x"] - bbox_o["x"])
+    )
+    assert vol == 2.0
+
+
+# ---------------------------------------------------------------------------
 # Integration tests: non-overlapping and fallback tile handling
 # ---------------------------------------------------------------------------
 
@@ -298,6 +379,17 @@ def test_non_overlapping_tile(tmp_path: Path):
     assert any("DAPI" in label for label in fused_image.channel_labels)
 
 
+def _fused_shape(plate_path: Path) -> tuple[int, ...]:
+    """Return the shape of the single fused image in a processed plate."""
+    plate = open_ome_zarr_plate(plate_path)
+    fused_acq_id = max(plate.acquisition_ids)
+    fused_image = next(
+        iter(plate.get_images(acquisition=fused_acq_id).values())
+    ).get_image()
+    assert len(fused_image.channel_labels) == 2
+    return fused_image.shape
+
+
 def test_fusion_region_intersection(tmp_path: Path):
     """Intersection fusion completes and is no larger than the union output.
 
@@ -313,19 +405,37 @@ def test_fusion_region_intersection(tmp_path: Path):
     inter_urls = _create_plate_with_far_tiles(inter_path, all_nonref_tiles_far=False)
     _run_stitch_and_register(inter_urls, str(tmp_path), fusion_region="intersection")
 
-    def _fused_shape(plate_path: Path) -> tuple[int, ...]:
-        plate = open_ome_zarr_plate(plate_path)
-        fused_acq_id = max(plate.acquisition_ids)
-        fused_image = next(
-            iter(plate.get_images(acquisition=fused_acq_id).values())
-        ).get_image()
-        assert len(fused_image.channel_labels) == 2
-        return fused_image.shape
-
     union_shape = _fused_shape(union_path)
     inter_shape = _fused_shape(inter_path)
     # Intersection drops the far tile's exclusive region -> smaller along x.
     assert inter_shape[-1] < union_shape[-1]
+
+
+def test_fusion_region_intersection_bbox(tmp_path: Path):
+    """intersection_bbox is smaller than union and matches the intersection box.
+
+    For a rectangular tile layout the per-pixel intersection already fills its
+    bounding box, so 'intersection' and 'intersection_bbox' share the same shape.
+    """
+    union_path = tmp_path / "union.zarr"
+    union_urls = _create_plate_with_far_tiles(union_path, all_nonref_tiles_far=False)
+    _run_stitch_and_register(union_urls, str(tmp_path), fusion_region="union")
+
+    inter_path = tmp_path / "intersection.zarr"
+    inter_urls = _create_plate_with_far_tiles(inter_path, all_nonref_tiles_far=False)
+    _run_stitch_and_register(inter_urls, str(tmp_path), fusion_region="intersection")
+
+    bbox_path = tmp_path / "intersection_bbox.zarr"
+    bbox_urls = _create_plate_with_far_tiles(bbox_path, all_nonref_tiles_far=False)
+    _run_stitch_and_register(
+        bbox_urls, str(tmp_path), fusion_region="intersection_bbox"
+    )
+
+    union_shape = _fused_shape(union_path)
+    inter_shape = _fused_shape(inter_path)
+    bbox_shape = _fused_shape(bbox_path)
+    assert bbox_shape[-1] < union_shape[-1]
+    assert bbox_shape == inter_shape
 
 
 def test_all_tiles_non_overlapping_fallback(tmp_path: Path):

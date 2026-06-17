@@ -78,7 +78,7 @@ def stitch_and_register_init(
     z_project: bool = True,
     tile_correction: TileCorrectionModel = TileCorrectionModel(),
     keep_original_acquisitions: bool = True,
-    fusion_region: Literal["union", "intersection"] = "union",
+    fusion_region: Literal["union", "intersection", "intersection_bbox"] = "union",
     interpolation_order: int = 0,
 ):
     """Stitch and register multiple acquisitions of a plate.
@@ -114,10 +114,13 @@ def stitch_and_register_init(
         keep_original_acquisitions: If True, keep original acquisitions after
             registration. If False, remove them.
         fusion_region: Which region of the registered cycles to save.
-            'union': save the full extent covered by any cycle (default).
-            'intersection': save only the region covered by every cycle.
+            'union': save the full extent covered by any cycle.
+            'intersection': tight box of the region covered by every cycle;
+            uncovered pixels inside it are set to 0.
+            'intersection_bbox': largest box fully covered by every cycle
+            (no pixels set to 0).
         interpolation_order: Spline interpolation order for resampling tiles
-            into the fused output. 0 (default) is nearest-neighbor (preserves
+            into the fused output. 0 is nearest-neighbor (preserves
             original pixel values), 1 is linear.
     """
     # TODO: Currently, we ignore the zarr_urls, and process all acquisitions found in

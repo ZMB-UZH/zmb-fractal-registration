@@ -207,17 +207,18 @@
             "default": "union",
             "enum": [
               "union",
-              "intersection"
+              "intersection",
+              "intersection_bbox"
             ],
             "title": "Fusion Region",
             "type": "string",
-            "description": "Which region of the registered cycles to save. 'union': save the full extent covered by any cycle (default). 'intersection': save only the region covered by every cycle."
+            "description": "Which region of the registered cycles to save. 'union': save the full extent covered by any cycle. 'intersection': tight box of the region covered by every cycle; uncovered pixels inside it are set to 0. 'intersection_bbox': largest box fully covered by every cycle (no pixels set to 0)."
           },
           "interpolation_order": {
             "default": 0,
             "title": "Interpolation Order",
             "type": "integer",
-            "description": "Spline interpolation order for resampling tiles into the fused output. 0 (default) is nearest-neighbor (preserves original pixel values), 1 is linear."
+            "description": "Spline interpolation order for resampling tiles into the fused output. 0 is nearest-neighbor (preserves original pixel values), 1 is linear."
           }
         },
         "required": [
@@ -308,7 +309,8 @@
                 "default": "union",
                 "enum": [
                   "union",
-                  "intersection"
+                  "intersection",
+                  "intersection_bbox"
                 ],
                 "title": "Fusion Region",
                 "type": "string"
