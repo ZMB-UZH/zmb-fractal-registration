@@ -1,6 +1,8 @@
 from pathlib import Path
 
 import numpy as np
+from multiview_stitcher import msi_utils
+from multiview_stitcher import spatial_image_utils as si_utils
 from ngio import (
     ChannelSelectionModel,
     ImageInWellPath,
@@ -12,6 +14,7 @@ from ngio import (
 from ngio.tables import RoiTable
 
 from zmb_fractal_registration._stitch_register.output_bbox import (
+    _compute_global_bbox,
     _coverage_cell_grid,
     _largest_covered_box,
     _tight_covered_box,
@@ -361,6 +364,81 @@ def test_largest_covered_box_3d():
         * (bbox_a["x"] - bbox_o["x"])
     )
     assert vol == 2.0
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for rounding the covered box to a whole pixel count
+# ---------------------------------------------------------------------------
+
+_ROUND_SPACING = 0.65  # um/px
+_ROUND_TILE_PX = 100
+# A registration shift that is deliberately not a whole number of pixels, so the
+# covered box width is fractional in pixels and ceil/floor actually differ.
+_ROUND_SUBPIXEL = 0.31 * _ROUND_SPACING
+
+
+def _single_tile_msims(offset: float) -> list:
+    """One cycle holding a single tile, translated by `offset` um in y and x."""
+    sim = si_utils.get_sim_from_array(
+        np.ones((1, _ROUND_TILE_PX, _ROUND_TILE_PX), dtype=np.uint16),
+        dims=["c", "y", "x"],
+        scale={"y": _ROUND_SPACING, "x": _ROUND_SPACING},
+        translation={"y": offset, "x": offset},
+        c_coords=["DAPI"],
+        transform_key="affine_registered",
+    )
+    return [msi_utils.get_msim_from_sim(sim, scale_factors=[])]
+
+
+def test_intersection_bbox_shape_rounds_down():
+    """The intersection_bbox canvas must fit inside the covered box.
+
+    output_origin is the centre of the first pixel, so the last pixel centre
+    lies at origin + (shape - 1) * spacing. Rounding the pixel count up would
+    push that centre past the covered box and yield a row/column with no data,
+    breaking the mode's "no pixels set to 0" promise.
+    """
+    msims = {"A": _single_tile_msims(0.0), "B": _single_tile_msims(_ROUND_SUBPIXEL)}
+    spacing_ref = {"y": _ROUND_SPACING, "x": _ROUND_SPACING}
+
+    _, shape = _compute_global_bbox(msims, ["A", "B"], spacing_ref, "intersection_bbox")
+
+    # Covered region is the overlap of the two tiles.
+    box_width = _ROUND_TILE_PX * _ROUND_SPACING - _ROUND_SUBPIXEL
+    exact_px = box_width / _ROUND_SPACING
+    assert exact_px % 1 != 0, "test is only meaningful for a fractional pixel count"
+
+    for dim in ("y", "x"):
+        assert shape[dim] == int(np.floor(exact_px))
+        # The canvas stays inside the covered box...
+        assert shape[dim] * _ROUND_SPACING <= box_width
+        # ...whereas rounding up would have overshot it.
+        assert np.ceil(exact_px) * _ROUND_SPACING > box_width
+
+
+def test_union_shape_still_rounds_up():
+    """union keeps rounding up, so its canvas contains the whole extent."""
+    msims = {"A": _single_tile_msims(0.0), "B": _single_tile_msims(_ROUND_SUBPIXEL)}
+    spacing_ref = {"y": _ROUND_SPACING, "x": _ROUND_SPACING}
+
+    _, shape = _compute_global_bbox(msims, ["A", "B"], spacing_ref, "union")
+
+    box_width = _ROUND_TILE_PX * _ROUND_SPACING + _ROUND_SUBPIXEL
+    for dim in ("y", "x"):
+        assert shape[dim] == int(np.ceil(box_width / _ROUND_SPACING))
+        assert shape[dim] * _ROUND_SPACING >= box_width
+
+
+def test_intersection_bbox_shape_exact_multiple_keeps_all_pixels():
+    """A grid-aligned box must not lose a pixel to floating-point error."""
+    aligned_shift = 10 * _ROUND_SPACING  # exactly 10 px, so the box is 90 px wide
+    msims = {"A": _single_tile_msims(0.0), "B": _single_tile_msims(aligned_shift)}
+    spacing_ref = {"y": _ROUND_SPACING, "x": _ROUND_SPACING}
+
+    _, shape = _compute_global_bbox(msims, ["A", "B"], spacing_ref, "intersection_bbox")
+
+    for dim in ("y", "x"):
+        assert shape[dim] == _ROUND_TILE_PX - 10
 
 
 # ---------------------------------------------------------------------------

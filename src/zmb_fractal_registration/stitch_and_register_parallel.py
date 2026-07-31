@@ -6,6 +6,17 @@
 # - add option to input different ROI table
 # - handle larger shifts between cycles by performing a pre-registration step
 # - optimize dask parallelization
+# - interpolation_order=0 leaves a 1-pixel zero frame around the outer edge of a
+#   fused cycle whenever the output canvas is not aligned to that cycle's pixel
+#   grid (i.e. whenever the registration shift is sub-pixel). The frame follows
+#   the canvas edge, not the tile edge, so shrinking the output box does not
+#   remove it - meaning fusion_region='intersection_bbox' cannot fully guarantee
+#   "no pixels set to 0" at order 0. order=1 is unaffected. Fixing it likely
+#   means snapping global_origin onto the reference cycle's pixel grid (which
+#   would also stop order-0 nearest-neighbour from introducing up to half a
+#   pixel of jitter per tile), though non-reference cycles cannot be aligned at
+#   the same time. Possibly an off-by-one in multiview-stitcher's order-0
+#   resampling path - worth checking upstream first.
 
 import logging
 import shutil

@@ -8,6 +8,10 @@ from zmb_fractal_registration._stitch_register.sim_geometry import (
     _get_origin_of_sim,
 )
 
+# Tolerance (in pixels) when converting a box width to a whole pixel count, so
+# that float error in the accumulated world coordinates cannot cost a pixel.
+_PIXEL_EPS = 1e-9
+
 
 def _get_tile_rects(
     msims_per_cycle: dict[str, list], cycles: list[str]
@@ -184,7 +188,8 @@ def _compute_global_bbox(
     - 'intersection': tight box around the region covered by every cycle (the
       box can still contain holes, which are zeroed during fusion).
     - 'intersection_bbox': largest axis-aligned box fully covered by every cycle,
-      so no pixels need to be zeroed.
+      so no pixels need to be zeroed. Its pixel count is rounded *down* (the
+      others round up) so the canvas cannot extend past the covered box.
 
     Raises:
         ValueError: If an intersection-based region is requested but the cycles
@@ -208,8 +213,21 @@ def _compute_global_bbox(
         else:  # intersection_bbox
             global_origin, global_antipode = _largest_covered_box(breaks, covered, dims)
 
-    global_shape = {
-        d: int(np.ceil((global_antipode[d] - global_origin[d]) / spacing_ref[d]))
-        for d in dims
+    n_pixels = {
+        d: (global_antipode[d] - global_origin[d]) / spacing_ref[d] for d in dims
     }
+    if fusion_region == "intersection_bbox":
+        # Round down. output_origin is the *centre* of the first pixel, so the
+        # last pixel centre sits at origin + (n-1)*spacing. Rounding up would
+        # append a row/column whose centre falls beyond the covered box and
+        # therefore carries no data, breaking this mode's promise that every
+        # output pixel is covered by every cycle. The epsilon keeps a width
+        # that is an exact multiple of the spacing from losing a pixel to
+        # floating-point error.
+        global_shape = {d: int(np.floor(v + _PIXEL_EPS)) for d, v in n_pixels.items()}
+    else:
+        # 'union' and 'intersection' are meant to *contain* their box, and a
+        # partially covered pixel at the edge is fine - for 'intersection' it
+        # is zeroed during fusion anyway.
+        global_shape = {d: int(np.ceil(v)) for d, v in n_pixels.items()}
     return global_origin, global_shape
