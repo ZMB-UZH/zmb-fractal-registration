@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 from multiview_stitcher import msi_utils
 from multiview_stitcher import spatial_image_utils as si_utils
 from ngio import (
@@ -518,6 +519,86 @@ def test_fusion_region_intersection_bbox(tmp_path: Path):
     bbox_shape = _fused_shape(bbox_path)
     assert bbox_shape[-1] < union_shape[-1]
     assert bbox_shape == inter_shape
+
+
+def _create_plate_with_mismatched_channels(plate_path: Path) -> list[str]:
+    """Create a plate where the second acquisition is missing a channel.
+
+    Acquisition 0 has ["DAPI", "GFP"], acquisition 1 only has ["DAPI"], mimicking
+    an imaging round that was acquired with fewer channels than the reference.
+    """
+    img_shape = (1, _FOV_PX, 2 * _FOV_PX - _OVERLAP_PX)
+    fov_size_um = _FOV_PX * _PIXEL_SIZE
+    overlap_um = _OVERLAP_PX * _PIXEL_SIZE
+
+    plate = create_empty_plate(
+        store=plate_path,
+        name="test_plate",
+        images=[
+            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
+            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
+        ],
+        overwrite=True,
+    )
+
+    zarr_urls = []
+    for idx, img_rel_path in enumerate(plate.images_paths()):
+        img_path = plate_path / img_rel_path
+        channels = ["DAPI", "GFP"] if idx == 0 else ["DAPI"]
+        container = create_synthetic_ome_zarr(
+            store=img_path,
+            shape=(len(channels), *img_shape[1:]),
+            axes_names="cyx",
+            channels_meta=channels,
+            overwrite=True,
+        )
+        rois = [
+            Roi.from_values(
+                slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
+                name="FOV_1",
+                y_micrometer_original=0.0,
+                x_micrometer_original=0.0,
+            ),
+            Roi.from_values(
+                slices={
+                    "y": (0.0, fov_size_um),
+                    "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
+                },
+                name="FOV_2",
+                y_micrometer_original=0.0,
+                x_micrometer_original=fov_size_um - overlap_um,
+            ),
+        ]
+        container.add_table("FOV_ROI_table", RoiTable(rois=rois))
+        zarr_urls.append(str(img_path))
+
+    return zarr_urls
+
+
+def test_registration_channel_missing_in_other_acquisition(tmp_path: Path):
+    """Task fails early and clearly if a cycle lacks the registration channel.
+
+    The registration channel is resolved on the reference acquisition only, so a
+    channel absent from another acquisition must be reported up front instead of
+    surfacing as a KeyError once registration of that cycle starts.
+    """
+    plate_path = tmp_path / "test.zarr"
+    zarr_urls = _create_plate_with_mismatched_channels(plate_path)
+
+    # Index 1 resolves to "GFP" on the reference, which cycle1 does not have.
+    ref_channel = ChannelSelectionModel(mode="index", identifier="1")
+    result = stitch_and_register_init(
+        zarr_urls=zarr_urls,
+        zarr_dir=str(tmp_path),
+        reference_channel=ref_channel,
+    )
+
+    for item in result["parallelization_list"]:
+        with pytest.raises(ValueError, match="GFP"):
+            stitch_and_register_parallel(
+                zarr_url=item["zarr_url"],
+                init_args=item["init_args"],
+            )
 
 
 def test_all_tiles_non_overlapping_fallback(tmp_path: Path):
