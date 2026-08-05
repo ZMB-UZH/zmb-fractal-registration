@@ -39,6 +39,7 @@ from pydantic import BaseModel, validate_call
 from zmb_fractal_registration._stitch_register.loading import (
     _get_msims,
     _resolve_registration_channel,
+    _validate_registration_channel,
 )
 from zmb_fractal_registration._stitch_register.output_bbox import _compute_global_bbox
 from zmb_fractal_registration._stitch_register.pre_registration import (
@@ -409,6 +410,9 @@ def stitch_and_register_parallel(
     )
     logger.info(
         f"Reference cycle: '{ref_cycle}', registration channel: '{reg_channel}'"
+    )
+    _validate_registration_channel(
+        containers, cycles, init_args.pyramid_level, reg_channel
     )
 
     # Step 1: load FOVs at the registration pyramid level.
