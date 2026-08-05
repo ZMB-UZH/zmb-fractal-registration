@@ -2,27 +2,44 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from multiview_stitcher import msi_utils
+from multiview_stitcher import msi_utils, param_utils
 from multiview_stitcher import spatial_image_utils as si_utils
+from multiview_stitcher.spatial_image_utils import get_affine_from_sim
 from ngio import (
     ChannelSelectionModel,
     ImageInWellPath,
     Roi,
     create_empty_plate,
     create_synthetic_ome_zarr,
+    open_ome_zarr_container,
     open_ome_zarr_plate,
 )
 from ngio.tables import RoiTable
 
+from zmb_fractal_registration._stitch_register.loading import _get_msims
 from zmb_fractal_registration._stitch_register.output_bbox import (
     _compute_global_bbox,
     _coverage_cell_grid,
     _largest_covered_box,
     _tight_covered_box,
 )
+from zmb_fractal_registration._stitch_register.pre_registration import (
+    PREREG_TRANSFORM_KEY,
+    _apply_correction_to_tiles,
+    _coarsest_usable_level,
+    _cycle_box,
+    _fuse_on_canvas,
+    _load_cycle_tiles,
+    _pre_register_cycles,
+    _set_anchor_transform,
+    _shared_canvas_shape,
+)
 from zmb_fractal_registration._stitch_register.registration import (
     _detect_outlier_tiles,
+    _fuse_masked,
+    _output_chunksize,
 )
+from zmb_fractal_registration._stitch_register.sim_geometry import _xaffine_to_matrix
 from zmb_fractal_registration.stitch_and_register_init import (
     TileCorrectionModel,
     stitch_and_register_init,
@@ -228,7 +245,10 @@ def _create_plate_with_far_tiles(
 
 
 def _run_stitch_and_register(
-    zarr_urls: list[str], zarr_dir: str, fusion_region: str = "union"
+    zarr_urls: list[str],
+    zarr_dir: str,
+    fusion_region: str = "union",
+    pre_registration: bool = False,
 ) -> None:
     """Run init + parallel stitch-and-register tasks for a list of zarr URLs."""
     ref_channel = ChannelSelectionModel(mode="label", identifier="DAPI")
@@ -237,6 +257,7 @@ def _run_stitch_and_register(
         zarr_dir=zarr_dir,
         reference_channel=ref_channel,
         fusion_region=fusion_region,
+        pre_registration=pre_registration,
     )
     for item in result["parallelization_list"]:
         stitch_and_register_parallel(
@@ -443,6 +464,54 @@ def test_intersection_bbox_shape_exact_multiple_keeps_all_pixels():
 
 
 # ---------------------------------------------------------------------------
+# Unit tests for the fusion output chunking
+# ---------------------------------------------------------------------------
+
+
+def _chunk_test_sim(z_planes: int | None, offset: float = 0.0):
+    """A single tile, 3D when z_planes is given, 2D otherwise."""
+    dims = ["c", "y", "x"] if z_planes is None else ["c", "z", "y", "x"]
+    shape = (1, 300, 300) if z_planes is None else (1, z_planes, 300, 300)
+    scale = {"y": 0.325, "x": 0.325}
+    translation = {"y": 0.0, "x": offset}
+    if z_planes is not None:
+        scale["z"] = 1.0
+        translation["z"] = 0.0
+    return si_utils.get_sim_from_array(
+        np.ones(shape, dtype=np.uint16),
+        dims=dims,
+        scale=scale,
+        translation=translation,
+        c_coords=["DAPI"],
+        transform_key="affine_registered",
+    )
+
+
+def test_output_chunksize_is_per_dimension():
+    """3D fusion gets its own chunk shape instead of a scalar on every axis."""
+    assert _output_chunksize([_chunk_test_sim(None)]) == {"y": 1024, "x": 1024}
+    assert _output_chunksize([_chunk_test_sim(40)]) == {"z": 16, "y": 256, "x": 256}
+
+
+def test_fused_3d_chunks_do_not_span_full_z():
+    """A 3D fused image must not be chunked as a single slab along z.
+
+    A scalar chunksize is expanded to every spatial dimension, so it asked for
+    z x 1024 x 1024 chunks - the whole z range at once, which is what made
+    fusing 3D data blow up in memory.
+    """
+    z_planes = 40
+    sims = [_chunk_test_sim(z_planes), _chunk_test_sim(z_planes, offset=50.0)]
+
+    fused = _fuse_masked(sims)  # lazy, nothing is computed here
+
+    chunks = fused.chunksizes
+    assert max(chunks["z"]) <= 16 < z_planes
+    assert max(chunks["y"]) <= 256
+    assert max(chunks["x"]) <= 256
+
+
+# ---------------------------------------------------------------------------
 # Integration tests: non-overlapping and fallback tile handling
 # ---------------------------------------------------------------------------
 
@@ -519,6 +588,313 @@ def test_fusion_region_intersection_bbox(tmp_path: Path):
     bbox_shape = _fused_shape(bbox_path)
     assert bbox_shape[-1] < union_shape[-1]
     assert bbox_shape == inter_shape
+
+
+# ---------------------------------------------------------------------------
+# Rough pre-registration of whole cycles
+# ---------------------------------------------------------------------------
+
+_PREREG_FOV_PX = 128
+_PREREG_OVERLAP_PX = 64
+# With 2 levels the coarsest level of the plate below is 64 x 96 px, which is
+# just large enough to be picked by _coarsest_usable_level.
+_PREREG_LEVELS = 2
+
+
+def _create_offset_plate(
+    plate_path: Path, offset_um: float, stray_tile_um: float | None = None
+) -> list[str]:
+    """Two acquisitions with identical content, the second with wrong stage coords.
+
+    The ROI slices (the pixel region each FOV is read from) are the same in both
+    acquisitions, but the `*_micrometer_original` values of the second one - the
+    stage coordinates the task initializes the tile positions from - are offset
+    by `offset_um` along x. The second acquisition therefore believes it sits
+    `offset_um` further along x than it really does.
+
+    When `stray_tile_um` is given, the second acquisition gets an extra tile
+    whose stage coordinate places it that far along x, which drags the origin
+    of that cycle's bounding box away from its actual content.
+    """
+    img_shape = (1, _PREREG_FOV_PX, 2 * _PREREG_FOV_PX - _PREREG_OVERLAP_PX)
+    fov_size_um = _PREREG_FOV_PX * _PIXEL_SIZE
+    overlap_um = _PREREG_OVERLAP_PX * _PIXEL_SIZE
+
+    plate = create_empty_plate(
+        store=plate_path,
+        name="test_plate",
+        images=[
+            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
+            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
+        ],
+        overwrite=True,
+    )
+
+    zarr_urls = []
+    for idx, img_rel_path in enumerate(plate.images_paths()):
+        img_path = plate_path / img_rel_path
+        container = create_synthetic_ome_zarr(
+            store=img_path,
+            shape=img_shape,
+            axes_names="cyx",
+            channels_meta=["DAPI"],
+            levels=_PREREG_LEVELS,
+            overwrite=True,
+        )
+        offset = offset_um if idx == 1 else 0.0
+        rois = [
+            Roi.from_values(
+                slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
+                name="FOV_1",
+                y_micrometer_original=0.0,
+                x_micrometer_original=offset,
+            ),
+            Roi.from_values(
+                slices={
+                    "y": (0.0, fov_size_um),
+                    "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
+                },
+                name="FOV_2",
+                y_micrometer_original=0.0,
+                x_micrometer_original=fov_size_um - overlap_um + offset,
+            ),
+        ]
+        if idx == 1 and stray_tile_um is not None:
+            # Reuses FOV_1's pixel region; only its world position is far away.
+            rois.append(
+                Roi.from_values(
+                    slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
+                    name="FOV_stray",
+                    y_micrometer_original=0.0,
+                    x_micrometer_original=stray_tile_um,
+                )
+            )
+        container.add_table("FOV_ROI_table", RoiTable(rois=rois))
+        zarr_urls.append(str(img_path))
+
+    return zarr_urls
+
+
+def _translations(msims: list, transform_key: str) -> list[np.ndarray]:
+    """Translation of the named transform of each tile."""
+    return [
+        param_utils.translation_from_affine(
+            _xaffine_to_matrix(
+                get_affine_from_sim(
+                    msi_utils.get_sim_from_msim(msim), transform_key=transform_key
+                )
+            )
+        )
+        for msim in msims
+    ]
+
+
+def test_coarsest_usable_level_skips_tiny_levels(tmp_path: Path):
+    """Pyramid levels below the minimum extent are not used for pre-registration."""
+    # 5 levels of a 64 x 96 image: only level 0 reaches 64 px in y.
+    small_urls = _create_test_plate(tmp_path / "small.zarr")
+    assert _coarsest_usable_level(open_ome_zarr_container(small_urls[0])) == "0"
+
+    # 2 levels of a 128 x 192 image: level 1 (64 x 96) is still large enough.
+    large_urls = _create_offset_plate(tmp_path / "large.zarr", offset_um=0.0)
+    assert _coarsest_usable_level(open_ome_zarr_container(large_urls[0])) == "1"
+
+
+def test_apply_correction_to_tiles_writes_separate_transform():
+    """The correction goes to the pre-reg key and leaves "fractal_input" alone."""
+    msims = _single_tile_msims(0.0)
+    msi_utils.set_affine_transform(
+        msims[0],
+        param_utils.affine_to_xaffine(
+            param_utils.affine_from_translation([1.0, 2.0]), t_coords=[0]
+        ),
+        "fractal_input",
+    )
+    correction = param_utils.affine_from_translation([10.0, 20.0])
+
+    _apply_correction_to_tiles(msims, correction)
+
+    assert np.allclose(_translations(msims, PREREG_TRANSFORM_KEY)[0], [11.0, 22.0])
+    assert np.allclose(_translations(msims, "fractal_input")[0], [1.0, 2.0])
+
+
+def test_apply_correction_to_tiles_without_correction_copies_input():
+    """A correction of None just copies "fractal_input" to the pre-reg key."""
+    msims = _single_tile_msims(0.0)
+    msi_utils.set_affine_transform(
+        msims[0],
+        param_utils.affine_to_xaffine(
+            param_utils.affine_from_translation([1.0, 2.0]), t_coords=[0]
+        ),
+        "fractal_input",
+    )
+
+    _apply_correction_to_tiles(msims, None)
+
+    assert np.allclose(_translations(msims, PREREG_TRANSFORM_KEY)[0], [1.0, 2.0])
+
+
+def test_pre_registration_recovers_offset(tmp_path: Path):
+    """A cycle with wrong stage coordinates is shifted back onto the reference."""
+    offset_um = 16 * _PIXEL_SIZE  # 16 px at full resolution, 8 px at level 1
+    zarr_urls = _create_offset_plate(tmp_path / "prereg.zarr", offset_um)
+
+    cycles = ["cycle0", "cycle1"]
+    containers = {
+        cycle: open_ome_zarr_container(url)
+        for cycle, url in zip(cycles, zarr_urls, strict=True)
+    }
+    msims_reg = {
+        cycle: _get_msims(
+            image=containers[cycle].get_image(path="0"),
+            fov_roi_table=containers[cycle].get_table("FOV_ROI_table"),
+            z_project=True,
+        )
+        for cycle in cycles
+    }
+    stage = _translations(msims_reg["cycle1"], "fractal_input")
+
+    _pre_register_cycles(containers, msims_reg, cycles, "cycle0", "DAPI", True)
+
+    prereg = _translations(msims_reg["cycle1"], PREREG_TRANSFORM_KEY)
+    # The offset was applied along x only, so the correction must undo it there
+    # and leave y untouched. Tolerance is 2 px of the pre-registration level.
+    atol = 2 * 2 * _PIXEL_SIZE
+    for t_stage, t_prereg in zip(stage, prereg, strict=True):
+        assert np.allclose(t_prereg - t_stage, [0.0, -offset_um], atol=atol)
+    # The raw stage transform is left untouched...
+    assert np.allclose(_translations(msims_reg["cycle1"], "fractal_input"), stage)
+    # ...and the reference cycle gets the key too, with no correction applied.
+    assert np.allclose(_translations(msims_reg["cycle0"], PREREG_TRANSFORM_KEY), 0.0)
+
+
+def test_shared_canvas_shape_is_union_of_extents():
+    """The canvas covers the largest extent of any cycle, in whole pixels."""
+    boxes = {
+        "a": ({"y": 0.0, "x": 0.0}, {"y": 10.0, "x": 10.0}),
+        "b": ({"y": 5.0, "x": 900.0}, {"y": 10.0, "x": 25.5}),
+    }
+    spacing = {"y": 1.0, "x": 1.0}
+    assert _shared_canvas_shape(boxes, ["a", "b"], spacing) == {"y": 10, "x": 26}
+
+
+def test_cycles_fuse_onto_identical_grid(tmp_path: Path):
+    """Two cycles fused on the shared canvas end up with the same geometry.
+
+    This is the invariant the whole approach rests on: identical geometry means
+    the region multiview-stitcher registers on is the full canvas.
+    """
+    cycles = ["cycle0", "cycle1"]
+    zarr_urls = _create_offset_plate(
+        tmp_path / "grid.zarr", offset_um=500.0, stray_tile_um=-300.0
+    )
+    containers = {
+        c: open_ome_zarr_container(u) for c, u in zip(cycles, zarr_urls, strict=True)
+    }
+    tiles, boxes = {}, {}
+    for c in cycles:
+        tiles[c], _ = _load_cycle_tiles(containers[c], z_project=True)
+        boxes[c] = _cycle_box(tiles[c])
+    spacing = si_utils.get_spacing_from_sim(
+        msi_utils.get_sim_from_msim(tiles["cycle0"][0]), asarray=False
+    )
+    shape = _shared_canvas_shape(boxes, cycles, spacing)
+
+    fused = {}
+    for c in cycles:
+        _set_anchor_transform(tiles[c], boxes[c][0], list(spacing.keys()))
+        fused[c] = _fuse_on_canvas(tiles[c], shape, spacing)
+
+    for c in cycles:
+        assert si_utils.get_shape_from_sim(fused[c], asarray=False) == shape
+        assert np.allclose(si_utils.get_origin_from_sim(fused[c], asarray=True), 0.0)
+        assert np.allclose(
+            si_utils.get_spacing_from_sim(fused[c], asarray=True),
+            si_utils.get_spacing_from_sim(fused["cycle0"], asarray=True),
+        )
+    # The stray tile widened the canvas well beyond a single cycle's extent.
+    assert shape["x"] * spacing["x"] > boxes["cycle0"][1]["x"]
+
+
+def test_pre_registration_recovers_offset_larger_than_extent(tmp_path: Path):
+    """A cycle displaced by many times the imaged extent is still recovered.
+
+    This is the case the stage coordinates cannot seed at all: the two cycles'
+    bounding boxes do not overlap, so a registration started from them has
+    nothing to work with.
+    """
+    offset_um = 500.0  # imaged extent is ~62 um, so ~8x
+    zarr_urls = _create_offset_plate(tmp_path / "far.zarr", offset_um)
+
+    cycles = ["cycle0", "cycle1"]
+    containers = {
+        c: open_ome_zarr_container(u) for c, u in zip(cycles, zarr_urls, strict=True)
+    }
+    msims_reg = {
+        c: _get_msims(
+            image=containers[c].get_image(path="0"),
+            fov_roi_table=containers[c].get_table("FOV_ROI_table"),
+            z_project=True,
+        )
+        for c in cycles
+    }
+    stage = _translations(msims_reg["cycle1"], "fractal_input")
+
+    _pre_register_cycles(containers, msims_reg, cycles, "cycle0", "DAPI", True)
+
+    prereg = _translations(msims_reg["cycle1"], PREREG_TRANSFORM_KEY)
+    atol = 2 * 2 * _PIXEL_SIZE
+    for t_stage, t_prereg in zip(stage, prereg, strict=True):
+        assert np.allclose(t_prereg - t_stage, [0.0, -offset_um], atol=atol)
+
+
+def test_pre_registration_survives_stray_tile_anchor(tmp_path: Path):
+    """A tile with a broken stage coordinate drags the anchor, not the result.
+
+    The stray tile becomes the origin of the cycle's bounding box, so the cycle
+    is anchored ~300 um away from its actual content. The shared canvas grows to
+    cover both, so no data is cropped and the registration still finds the real
+    displacement.
+    """
+    offset_um = 500.0
+    zarr_urls = _create_offset_plate(
+        tmp_path / "stray.zarr", offset_um, stray_tile_um=-300.0
+    )
+
+    cycles = ["cycle0", "cycle1"]
+    containers = {
+        c: open_ome_zarr_container(u) for c, u in zip(cycles, zarr_urls, strict=True)
+    }
+    msims_reg = {
+        c: _get_msims(
+            image=containers[c].get_image(path="0"),
+            fov_roi_table=containers[c].get_table("FOV_ROI_table"),
+            z_project=True,
+        )
+        for c in cycles
+    }
+    stage = _translations(msims_reg["cycle1"], "fractal_input")
+
+    _pre_register_cycles(containers, msims_reg, cycles, "cycle0", "DAPI", True)
+
+    prereg = _translations(msims_reg["cycle1"], PREREG_TRANSFORM_KEY)
+    atol = 2 * 2 * _PIXEL_SIZE
+    for t_stage, t_prereg in zip(stage, prereg, strict=True):
+        assert np.allclose(t_prereg - t_stage, [0.0, -offset_um], atol=atol)
+
+
+def test_pre_registration_task(tmp_path: Path):
+    """The full task runs with pre_registration enabled."""
+    plate_path = tmp_path / "prereg_task.zarr"
+    zarr_urls = _create_offset_plate(plate_path, offset_um=16 * _PIXEL_SIZE)
+    _run_stitch_and_register(zarr_urls, str(tmp_path), pre_registration=True)
+
+    plate = open_ome_zarr_plate(plate_path)
+    fused_acq_id = max(plate.acquisition_ids)
+    fused_images = list(plate.get_images(acquisition=fused_acq_id).values())
+    assert len(fused_images) == 1
+    fused_image = fused_images[0].get_image()
+    assert len(fused_image.channel_labels) == 2
 
 
 def _create_plate_with_mismatched_channels(plate_path: Path) -> list[str]:

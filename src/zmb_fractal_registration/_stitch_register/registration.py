@@ -22,35 +22,93 @@ from zmb_fractal_registration.stitch_and_register_init import TileCorrectionMode
 
 logger = logging.getLogger(__name__)
 
+# Output chunks used when fusing. A scalar chunksize is expanded by
+# multiview-stitcher to *every* spatial dimension, so on 3D data it asks for
+# chunks of (z x 1024 x 1024) - tens of millions of voxels. Fusing one chunk
+# holds that chunk plus every input tile overlapping it (resampled to float32)
+# and their blending weights, and dask fuses several chunks concurrently, so
+# peak memory is a multiple of the chunk size. These keep the voxels per chunk
+# the same in 3D as in 2D.
+_CHUNKSIZE_2D = {"y": 1024, "x": 1024}
+_CHUNKSIZE_3D = {"z": 16, "y": 256, "x": 256}
 
-def _fuse_masked(sims: list):
+
+def _output_chunksize(sims: list) -> dict[str, int]:
+    """Per-dimension output chunks for fusing the given spatial images."""
+    spatial_dims = si_utils.get_spatial_dims_from_sim(sims[0])
+    template = _CHUNKSIZE_3D if "z" in spatial_dims else _CHUNKSIZE_2D
+    return {dim: template[dim] for dim in spatial_dims}
+
+
+def _fuse_masked(
+    sims: list,
+    transform_key: str = "affine_registered",
+    alias_key: str = "fractal_input",
+    interpolation_order: int = 0,
+    output_origin: dict[str, float] | None = None,
+    output_shape: dict[str, int] | None = None,
+    output_spacing: dict[str, float] | None = None,
+):
     """Fuse spatial images, mask non-tile regions with NaN, and alias the transform.
 
-    All sims must have an "affine_registered" transform. The returned image
-    has NaN outside the union of tile footprints and an additional
-    "fractal_input" transform alias pointing to "affine_registered".
+    All sims must have a transform under `transform_key`. The returned image
+    has NaN outside the union of tile footprints and an additional `alias_key`
+    transform alias pointing to `transform_key`, so that the fused image can be
+    registered together with tiles that use `alias_key` as their input position.
+    Masking makes the result floating point (float32 for the usual integer
+    inputs, since NaN cannot be represented in an integer dtype).
+
+    The output canvas defaults to the union of the input tiles; passing
+    `output_origin`/`output_shape`/`output_spacing` fuses onto an explicitly
+    given canvas instead, which is how several cycles are put onto a shared
+    grid.
+
+    Resampling defaults to nearest-neighbour: these fused images only serve as
+    registration references, so keeping the original pixel values is preferable
+    to smoothing them.
     """
-    # TODO: optimize chunksize
+    chunksize = _output_chunksize(sims)
+    canvas_kwargs = {
+        "output_origin": output_origin,
+        "output_shape": output_shape,
+        "output_spacing": output_spacing,
+    }
     sim_fused = fusion.fuse(
-        sims, transform_key="affine_registered", output_chunksize=1024
+        sims,
+        transform_key=transform_key,
+        interpolation_order=interpolation_order,
+        output_chunksize=chunksize,
+        **canvas_kwargs,
     )
     # Coverage is channel-independent: fuse a single-channel ones mask with
     # max_fusion (skips the blending-weight computation), then drop the channel
     # dim so it broadcasts across all channels of sim_fused.
     mask = fusion.fuse(
         [xr.ones_like(s.isel(c=[0])) for s in sims],
-        transform_key="affine_registered",
+        transform_key=transform_key,
         fusion_func=fusion.max_fusion,
-        output_chunksize=1024,
+        interpolation_order=interpolation_order,
+        output_chunksize=chunksize,
+        **canvas_kwargs,
     )
     mask = mask.isel(c=0, drop=True)
-    sim_fused = xr.where(mask > 0, sim_fused, np.nan)
-    sim_fused.transforms["fractal_input"] = sim_fused.transforms["affine_registered"]
+    # np.float32 rather than a bare np.nan (a python float, i.e. float64): NaN
+    # forces a float dtype anyway, and multiview-stitcher casts to float32
+    # before registering, so float64 would only double the memory of every
+    # intermediate fused image for precision that is discarded downstream.
+    sim_fused = xr.where(mask > 0, sim_fused, np.float32(np.nan))
+    sim_fused.transforms[alias_key] = sim_fused.transforms[transform_key]
     return sim_fused
 
 
-def _stitch_and_fuse_reference(msims_ref: list, reg_channel: str):
+def _stitch_and_fuse_reference(
+    msims_ref: list, reg_channel: str, init_transform_key: str = "fractal_input"
+):
     """Stitch reference tiles and fuse them into a masked reference image.
+
+    `init_transform_key` is the transform the tiles start from, and the key the
+    fused image is aliased under so that other cycles can be registered against
+    it.
 
     Returns a spatial image (down-sampled, lazy) that covers the full stitched
     FOV and has NaN outside the tile coverage area.
@@ -58,11 +116,14 @@ def _stitch_and_fuse_reference(msims_ref: list, reg_channel: str):
     registration.register(
         msims_ref,
         reg_channel=reg_channel,
-        transform_key="fractal_input",
+        transform_key=init_transform_key,
         new_transform_key="affine_registered",
         pre_registration_pruning_method="keep_axis_aligned",
     )
-    return _fuse_masked([msi_utils.get_sim_from_msim(msim) for msim in msims_ref])
+    return _fuse_masked(
+        [msi_utils.get_sim_from_msim(msim) for msim in msims_ref],
+        alias_key=init_transform_key,
+    )
 
 
 def _has_overlap_with_reference_tiles(
@@ -72,7 +133,7 @@ def _has_overlap_with_reference_tiles(
 
     Overlap is checked using axis-aligned bounding boxes in world space.
     transform_key is used for msim; ref_transform_key is used for each
-    reference tile (typically the stitched transform after Step 2).
+    reference tile (typically the stitched transform after Step 3).
     A return value of False means the tile does not spatially overlap with
     any reference tile and registration would produce an unreliable result.
     """
@@ -105,11 +166,12 @@ def _register_cycle_tiles(
     sim_fused_ref,
     reg_channel: str,
     ref_msims: list,
+    init_transform_key: str = "fractal_input",
 ) -> list[int]:
     """Register all tiles in one non-reference cycle against the fused reference.
 
     Tiles that have no spatial overlap with any reference tile are skipped and
-    their indices are returned for re-registration in Step 4.
+    their indices are returned for re-registration in Step 5.
     Overlapping tiles are registered via dask-delayed tasks (computed here).
 
     Returns:
@@ -122,7 +184,7 @@ def _register_cycle_tiles(
         if not _has_overlap_with_reference_tiles(
             msim,
             ref_msims,
-            transform_key="fractal_input",
+            transform_key=init_transform_key,
             ref_transform_key="affine_registered",
         ):
             no_overlap_indices.append(i)
@@ -130,7 +192,7 @@ def _register_cycle_tiles(
         task = delayed(registration.register)(
             [msi_utils.get_msim_from_sim(sim_fused_ref), msim],
             reg_channel=reg_channel,
-            transform_key="fractal_input",
+            transform_key=init_transform_key,
             new_transform_key="affine_registered",
             pre_registration_pruning_method=None,
             groupwise_resolution_kwargs={"reference_view": 0},
@@ -142,8 +204,13 @@ def _register_cycle_tiles(
     return no_overlap_indices
 
 
-def _collect_shifts(msims: list, no_overlap_set: set) -> tuple[list[int], list]:
+def _collect_shifts(
+    msims: list, no_overlap_set: set, init_transform_key: str = "fractal_input"
+) -> tuple[list[int], list]:
     """Collect per-tile (registered - input) shifts, skipping no-overlap tiles.
+
+    The shifts are relative to `init_transform_key`, i.e. relative to whatever
+    position the tiles were registered from.
 
     Returns:
         reg_tile_indices: Index of each tile whose shift was collected.
@@ -161,7 +228,9 @@ def _collect_shifts(msims: list, no_overlap_set: set) -> tuple[list[int], list]:
             )
         )
         t_in = param_utils.translation_from_affine(
-            _xaffine_to_matrix(get_affine_from_sim(sim, transform_key="fractal_input"))
+            _xaffine_to_matrix(
+                get_affine_from_sim(sim, transform_key=init_transform_key)
+            )
         )
         reg_tile_indices.append(i)
         shifts.append(t_reg - t_in)
@@ -260,12 +329,19 @@ def _apply_mean_shift_to_tiles(
     mean_shift: np.ndarray,
     ndim: int,
     transform_key: str = "affine_registered",
+    init_transform_key: str = "fractal_input",
 ) -> None:
-    """Store stage_position + mean_shift as the named transform for each tile."""
+    """Store input_position + mean_shift as the named transform for each tile.
+
+    The input position is taken from `init_transform_key`, i.e. the same
+    position the collected shifts are relative to.
+    """
     for tile_idx in tile_indices:
         sim = msi_utils.get_sim_from_msim(msims[tile_idx])
         t_in = param_utils.translation_from_affine(
-            _xaffine_to_matrix(get_affine_from_sim(sim, transform_key="fractal_input"))
+            _xaffine_to_matrix(
+                get_affine_from_sim(sim, transform_key=init_transform_key)
+            )
         )
         matrix = np.eye(ndim + 1)
         matrix[:ndim, ndim] = t_in + mean_shift
@@ -282,21 +358,22 @@ def _register_leftover_tiles(
     reg_channel: str,
     cycle: str,
     correction_method: str = "reregister",
+    init_transform_key: str = "fractal_input",
 ) -> None:
     """Correct outlier and no-overlap tiles using inlier tile information.
 
     Two correction methods are supported (controlled by correction_method):
 
-    - ``"mean_shift"``: Apply the mean (registered - stage) translation of all
+    - ``"mean_shift"``: Apply the mean (registered - input) translation of all
       inlier tiles directly to each leftover tile. Fast and deterministic, but
       ignores tile-specific image content.
     - ``"reregister"``: Fuse the inlier tiles into a reference image and
-      re-register each leftover tile against it, seeded from stage position +
-      mean inlier shift. Falls back to mean_shift if there is not enough overlap
-      with the fused inlier.
+      re-register each leftover tile against it, seeded from its input position
+      + mean inlier shift. Falls back to mean_shift if there is not enough
+      overlap with the fused inlier.
 
-    In both cases, falls back to the raw stage position when there are no
-    inlier tiles.
+    In both cases, falls back to the input position (`init_transform_key`) when
+    there are no inlier tiles.
     """
     if not tiles_to_correct:
         return
@@ -306,13 +383,13 @@ def _register_leftover_tiles(
     if not ok_indices:
         logger.warning(
             f"Cycle '{cycle}': no inlier tiles available; "
-            f"leftover tiles will keep their stage position."
+            f"leftover tiles will keep their input position."
         )
         for tile_idx in sorted(tiles_to_correct):
             msim = msims[tile_idx]
             sim = msi_utils.get_sim_from_msim(msim)
             matrix = _xaffine_to_matrix(
-                get_affine_from_sim(sim, transform_key="fractal_input")
+                get_affine_from_sim(sim, transform_key=init_transform_key)
             )
             msi_utils.set_affine_transform(
                 msim,
@@ -321,8 +398,8 @@ def _register_leftover_tiles(
             )
         return
 
-    # Reuse _collect_shifts to compute mean (registered - stage) shift across inliers.
-    _, inlier_shifts = _collect_shifts(msims, tiles_to_correct)
+    # Reuse _collect_shifts to compute mean (registered - input) shift across inliers.
+    _, inlier_shifts = _collect_shifts(msims, tiles_to_correct, init_transform_key)
     mean_shift = np.mean(inlier_shifts, axis=0)
     ndim = len(mean_shift)
     sorted_tile_indices = sorted(tiles_to_correct)
@@ -336,7 +413,13 @@ def _register_leftover_tiles(
             f"Cycle '{cycle}': applying mean inlier shift to "
             f"{len(sorted_tile_indices)} leftover tile(s) (no re-registration)."
         )
-        _apply_mean_shift_to_tiles(msims, sorted_tile_indices, mean_shift, ndim)
+        _apply_mean_shift_to_tiles(
+            msims,
+            sorted_tile_indices,
+            mean_shift,
+            ndim,
+            init_transform_key=init_transform_key,
+        )
         return
 
     # correction_method == "reregister"
@@ -349,9 +432,14 @@ def _register_leftover_tiles(
         [msi_utils.get_sim_from_msim(msims[i]) for i in ok_indices]
     )
 
-    # Seed each leftover tile from stage position + mean inlier shift.
+    # Seed each leftover tile from its input position + mean inlier shift.
     _apply_mean_shift_to_tiles(
-        msims, sorted_tile_indices, mean_shift, ndim, transform_key=_INIT_KEY
+        msims,
+        sorted_tile_indices,
+        mean_shift,
+        ndim,
+        transform_key=_INIT_KEY,
+        init_transform_key=init_transform_key,
     )
 
     # Alias the fused inlier's position under the shared init key.
@@ -381,4 +469,10 @@ def _register_leftover_tiles(
             f"Cycle '{cycle}': leftover tile registration failed (not enough overlap "
             f"with fused inlier); falling back to mean inlier shift."
         )
-        _apply_mean_shift_to_tiles(msims, sorted_tile_indices, mean_shift, ndim)
+        _apply_mean_shift_to_tiles(
+            msims,
+            sorted_tile_indices,
+            mean_shift,
+            ndim,
+            init_transform_key=init_transform_key,
+        )

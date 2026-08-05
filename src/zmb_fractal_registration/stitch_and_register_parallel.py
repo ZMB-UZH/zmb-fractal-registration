@@ -4,8 +4,14 @@
 # - add option to get initial positions from grid alignment instead of original stage
 #   positions in metadata
 # - add option to input different ROI table
-# - handle larger shifts between cycles by performing a pre-registration step
 # - optimize dask parallelization
+# - Step 4 recomputes the fused reference once per tile: _register_cycle_tiles
+#   passes a fresh msi_utils.get_msim_from_sim(sim_fused_ref) into every delayed
+#   register task, and the lazy fused reference is not shared between them
+#   (measured: 3 executions of its 1-block dask graph for 2 registered tiles).
+#   Computing it once before the loop should remove that cost - the
+#   pre-registration step already does this, via .compute() on its fused
+#   reference, so that it is loaded into memory only once.
 # - interpolation_order=0 leaves a 1-pixel zero frame around the outer edge of a
 #   fused cycle whenever the output canvas is not aligned to that cycle's pixel
 #   grid (i.e. whenever the registration shift is sub-pixel). The frame follows
@@ -36,9 +42,14 @@ from zmb_fractal_registration._stitch_register.loading import (
     _validate_registration_channel,
 )
 from zmb_fractal_registration._stitch_register.output_bbox import _compute_global_bbox
+from zmb_fractal_registration._stitch_register.pre_registration import (
+    PREREG_TRANSFORM_KEY,
+    _pre_register_cycles,
+)
 from zmb_fractal_registration._stitch_register.registration import (
     _collect_shifts,
     _detect_outlier_tiles,
+    _output_chunksize,
     _register_cycle_tiles,
     _register_leftover_tiles,
     _stitch_and_fuse_reference,
@@ -65,6 +76,11 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
         pyramid_level: Pyramid level used for stitching/registration.
         z_project: If True, perform stitching/registration on a z-projection.
             If False, operate on the full image volume.
+        pre_registration: If True, roughly align whole cycles against the
+            reference cycle before the accurate stitching/registration. Each
+            cycle is fused from its stage coordinates at the coarsest pyramid
+            level and registered as a whole, assuming all cycles cover roughly
+            the same area.
         keep_original_acquisitions: If True, keep the original acquisitions.
             If False, remove them after processing.
         tile_correction: Settings for correcting non-overlapping tiles and
@@ -86,6 +102,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
     reference_channel: ChannelSelectionModel
     pyramid_level: int = 0
     z_project: bool = True
+    pre_registration: bool = False
     keep_original_acquisitions: bool = True
     tile_correction: TileCorrectionModel = TileCorrectionModel()
     fusion_region: Literal["union", "intersection", "intersection_bbox"] = "union"
@@ -97,7 +114,7 @@ def _load_registration_msims(
 ) -> dict[str, list]:
     """Step 1: load all FOVs per cycle at the registration pyramid level."""
     logger.info(
-        f"[Step 1/7] Loading FOVs at pyramid level {pyramid_level}"
+        f"[Step 1/8] Loading FOVs at pyramid level {pyramid_level}"
         f"{' (z-projected)' if z_project else ''}."
     )
     msims_reg = {}
@@ -117,14 +134,15 @@ def _register_cycles_to_reference(
     ref_cycle: str,
     sim_fused_ref,
     reg_channel: str,
+    init_transform_key: str,
 ) -> dict[str, list[int]]:
-    """Step 3: register each non-reference cycle's tiles against the reference.
+    """Step 4: register each non-reference cycle's tiles against the reference.
 
     Returns the indices of tiles per cycle that had no overlap with the
-    reference and are deferred to Step 4.
+    reference and are deferred to Step 5.
     """
     logger.info(
-        f"[Step 3/7] Registering {len(cycles) - 1} non-reference cycle(s) "
+        f"[Step 4/8] Registering {len(cycles) - 1} non-reference cycle(s) "
         f"against fused reference."
     )
     no_overlap_indices: dict[str, list[int]] = {}
@@ -136,7 +154,11 @@ def _register_cycles_to_reference(
             f"against fused reference."
         )
         no_overlap = _register_cycle_tiles(
-            msims_reg[cycle], sim_fused_ref, reg_channel, msims_reg[ref_cycle]
+            msims_reg[cycle],
+            sim_fused_ref,
+            reg_channel,
+            msims_reg[ref_cycle],
+            init_transform_key,
         )
         no_overlap_indices[cycle] = no_overlap
         n_reg = len(msims_reg[cycle]) - len(no_overlap)
@@ -144,7 +166,7 @@ def _register_cycles_to_reference(
             f"Cycle '{cycle}': {n_reg} tile(s) registered"
             + (
                 f"; {len(no_overlap)} had no overlap with the reference "
-                "(deferred to Step 4)."
+                "(deferred to Step 5)."
                 if no_overlap
                 else "."
             )
@@ -160,14 +182,15 @@ def _correct_leftover_tiles(
     no_overlap_indices: dict[str, list[int]],
     tile_correction: TileCorrectionModel,
     reg_channel: str,
+    init_transform_key: str,
 ) -> None:
-    """Step 4: detect outlier tiles and re-register leftover tiles per cycle."""
+    """Step 5: detect outlier tiles and re-register leftover tiles per cycle."""
     tcm = tile_correction
     _outlier_desc = tcm.outlier_filter_mode + (
         f" (threshold={tcm.threshold})" if tcm.outlier_filter_mode != "disabled" else ""
     )
     logger.info(
-        f"[Step 4/7] Correcting leftover tiles "
+        f"[Step 5/8] Correcting leftover tiles "
         f"(outlier detection: {_outlier_desc}, correction: {tcm.correction_method})."
     )
 
@@ -175,7 +198,9 @@ def _correct_leftover_tiles(
         if cycle == ref_cycle:
             continue
         no_overlap_set = set(no_overlap_indices.get(cycle, []))
-        reg_tile_indices, shifts = _collect_shifts(msims_reg[cycle], no_overlap_set)
+        reg_tile_indices, shifts = _collect_shifts(
+            msims_reg[cycle], no_overlap_set, init_transform_key
+        )
         outlier_indices = _detect_outlier_tiles(shifts, reg_tile_indices, tcm, cycle)
         tiles_to_correct = no_overlap_set | outlier_indices
         if tiles_to_correct:
@@ -189,18 +214,19 @@ def _correct_leftover_tiles(
             reg_channel,
             cycle,
             tcm.correction_method,
+            init_transform_key,
         )
 
 
 def _transfer_transforms_to_full_res(
     containers: dict, msims_reg: dict[str, list], cycles: list[str], z_project: bool
 ) -> dict[str, list]:
-    """Step 5: reload FOVs at full resolution and transfer the transforms.
+    """Step 6: reload FOVs at full resolution and transfer the transforms.
 
     Expands 2D affines to 3D when z_project was used during registration.
     """
     logger.info(
-        "[Step 5/7] Reloading FOVs at full resolution and transferring transforms."
+        "[Step 6/8] Reloading FOVs at full resolution and transferring transforms."
     )
     msims_fusion = {}
     for cycle in cycles:
@@ -236,13 +262,13 @@ def _fuse_cycles(
     fusion_region: str,
     interpolation_order: int,
 ):
-    """Step 6: compute the global bounding box and fuse all cycles into one image.
+    """Step 7: compute the global bounding box and fuse all cycles into one image.
 
     For 'intersection', pixels not covered by every cycle inside the box are set
     to 0.
     """
     logger.info(
-        f"[Step 6/7] Computing global bounding box ({fusion_region}) and "
+        f"[Step 7/8] Computing global bounding box ({fusion_region}) and "
         f"fusing all cycles (interpolation_order={interpolation_order})."
     )
     spacing_ref = get_spacing_from_sim(
@@ -259,11 +285,12 @@ def _fuse_cycles(
     for cycle in cycles:
         logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
         cycle_sims = [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
+        chunksize = _output_chunksize(cycle_sims)
         sims_fused[cycle] = fusion.fuse(
             cycle_sims,
             transform_key="affine_registered",
             interpolation_order=interpolation_order,
-            output_chunksize=1024,
+            output_chunksize=chunksize,
             output_origin=global_origin,
             output_shape=global_shape,
         )
@@ -274,7 +301,7 @@ def _fuse_cycles(
                 transform_key="affine_registered",
                 fusion_func=fusion.max_fusion,
                 interpolation_order=interpolation_order,
-                output_chunksize=1024,
+                output_chunksize=chunksize,
                 output_origin=global_origin,
                 output_shape=global_shape,
             )
@@ -309,9 +336,9 @@ def _write_fused_image(
     zarr_url: str,
     sim_fused_all,
 ) -> None:
-    """Step 7: write the fused image to the output OME-Zarr store."""
+    """Step 8: write the fused image to the output OME-Zarr store."""
     logger.info(
-        f"[Step 7/7] Writing fused image to '{zarr_url}' "
+        f"[Step 8/8] Writing fused image to '{zarr_url}' "
         f"(shape: {sim_fused_all.shape}, dims: {sim_fused_all.dims})."
     )
     channels_meta_all = [
@@ -352,7 +379,8 @@ def stitch_and_register_parallel(
         f"Starting stitch_and_register_parallel for zarr_url={zarr_url} with "
         f"{len(init_args.zarr_urls_to_register)} acquisitions "
         f"(reference index: {init_args.reference_acquisition_index}, "
-        f"pyramid_level: {init_args.pyramid_level}, z_project: {init_args.z_project})"
+        f"pyramid_level: {init_args.pyramid_level}, z_project: {init_args.z_project}, "
+        f"pre_registration: {init_args.pre_registration})"
     )
 
     if len(init_args.zarr_urls_to_register) < 2:
@@ -394,20 +422,39 @@ def stitch_and_register_parallel(
         containers, cycles, init_args.pyramid_level, z_project
     )
 
-    # Step 2: stitch the reference cycle into a masked reference image.
+    # Step 2: roughly pre-register whole cycles against the reference cycle.
+    # The rough result is stored under its own transform key, which the
+    # following steps then start from instead of the raw stage coordinates.
+    if init_args.pre_registration:
+        logger.info(
+            f"[Step 2/8] Rough pre-registration of {len(cycles) - 1} non-reference "
+            f"cycle(s) at the coarsest pyramid level."
+        )
+        _pre_register_cycles(
+            containers, msims_reg, cycles, ref_cycle, reg_channel, z_project
+        )
+        init_transform_key = PREREG_TRANSFORM_KEY
+        logger.info("Rough pre-registration complete.")
+    else:
+        init_transform_key = "fractal_input"
+        logger.info("[Step 2/8] Rough pre-registration disabled; skipping.")
+
+    # Step 3: stitch the reference cycle into a masked reference image.
     logger.info(
-        f"[Step 2/7] Stitching reference cycle '{ref_cycle}' "
+        f"[Step 3/8] Stitching reference cycle '{ref_cycle}' "
         f"({len(msims_reg[ref_cycle])} tile(s))."
     )
-    sim_fused_ref = _stitch_and_fuse_reference(msims_reg[ref_cycle], reg_channel)
+    sim_fused_ref = _stitch_and_fuse_reference(
+        msims_reg[ref_cycle], reg_channel, init_transform_key
+    )
     logger.info("Reference stitching and fusion complete.")
 
-    # Step 3: register each non-reference cycle against the fused reference.
+    # Step 4: register each non-reference cycle against the fused reference.
     no_overlap_indices = _register_cycles_to_reference(
-        msims_reg, cycles, ref_cycle, sim_fused_ref, reg_channel
+        msims_reg, cycles, ref_cycle, sim_fused_ref, reg_channel, init_transform_key
     )
 
-    # Step 4: correct outlier and no-overlap (leftover) tiles.
+    # Step 5: correct outlier and no-overlap (leftover) tiles.
     _correct_leftover_tiles(
         msims_reg,
         cycles,
@@ -415,14 +462,15 @@ def stitch_and_register_parallel(
         no_overlap_indices,
         init_args.tile_correction,
         reg_channel,
+        init_transform_key,
     )
 
-    # Step 5: reload at full resolution and transfer the computed transforms.
+    # Step 6: reload at full resolution and transfer the computed transforms.
     msims_fusion = _transfer_transforms_to_full_res(
         containers, msims_reg, cycles, z_project
     )
 
-    # Step 6: fuse every cycle into a shared output canvas.
+    # Step 7: fuse every cycle into a shared output canvas.
     sim_fused_all = _fuse_cycles(
         containers,
         msims_fusion,
@@ -432,7 +480,7 @@ def stitch_and_register_parallel(
         init_args.interpolation_order,
     )
 
-    # Step 7: write the fused image to the output OME-Zarr store.
+    # Step 8: write the fused image to the output OME-Zarr store.
     _write_fused_image(containers, ref_cycle, cycles, zarr_url, sim_fused_all)
 
     image_list_updates = [
