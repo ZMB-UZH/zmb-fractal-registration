@@ -22,6 +22,23 @@ from zmb_fractal_registration.stitch_and_register_init import TileCorrectionMode
 
 logger = logging.getLogger(__name__)
 
+# Output chunks used when fusing. A scalar chunksize is expanded by
+# multiview-stitcher to *every* spatial dimension, so on 3D data it asks for
+# chunks of (z x 1024 x 1024) - tens of millions of voxels. Fusing one chunk
+# holds that chunk plus every input tile overlapping it (resampled to float32)
+# and their blending weights, and dask fuses several chunks concurrently, so
+# peak memory is a multiple of the chunk size. These keep the voxels per chunk
+# the same in 3D as in 2D.
+_CHUNKSIZE_2D = {"y": 1024, "x": 1024}
+_CHUNKSIZE_3D = {"z": 16, "y": 256, "x": 256}
+
+
+def _output_chunksize(sims: list) -> dict[str, int]:
+    """Per-dimension output chunks for fusing the given spatial images."""
+    spatial_dims = si_utils.get_spatial_dims_from_sim(sims[0])
+    template = _CHUNKSIZE_3D if "z" in spatial_dims else _CHUNKSIZE_2D
+    return {dim: template[dim] for dim in spatial_dims}
+
 
 def _fuse_masked(
     sims: list,
@@ -50,7 +67,7 @@ def _fuse_masked(
     registration references, so keeping the original pixel values is preferable
     to smoothing them.
     """
-    # TODO: optimize chunksize
+    chunksize = _output_chunksize(sims)
     canvas_kwargs = {
         "output_origin": output_origin,
         "output_shape": output_shape,
@@ -60,7 +77,7 @@ def _fuse_masked(
         sims,
         transform_key=transform_key,
         interpolation_order=interpolation_order,
-        output_chunksize=1024,
+        output_chunksize=chunksize,
         **canvas_kwargs,
     )
     # Coverage is channel-independent: fuse a single-channel ones mask with
@@ -71,7 +88,7 @@ def _fuse_masked(
         transform_key=transform_key,
         fusion_func=fusion.max_fusion,
         interpolation_order=interpolation_order,
-        output_chunksize=1024,
+        output_chunksize=chunksize,
         **canvas_kwargs,
     )
     mask = mask.isel(c=0, drop=True)

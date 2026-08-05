@@ -36,6 +36,8 @@ from zmb_fractal_registration._stitch_register.pre_registration import (
 )
 from zmb_fractal_registration._stitch_register.registration import (
     _detect_outlier_tiles,
+    _fuse_masked,
+    _output_chunksize,
 )
 from zmb_fractal_registration._stitch_register.sim_geometry import _xaffine_to_matrix
 from zmb_fractal_registration.stitch_and_register_init import (
@@ -459,6 +461,54 @@ def test_intersection_bbox_shape_exact_multiple_keeps_all_pixels():
 
     for dim in ("y", "x"):
         assert shape[dim] == _ROUND_TILE_PX - 10
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for the fusion output chunking
+# ---------------------------------------------------------------------------
+
+
+def _chunk_test_sim(z_planes: int | None, offset: float = 0.0):
+    """A single tile, 3D when z_planes is given, 2D otherwise."""
+    dims = ["c", "y", "x"] if z_planes is None else ["c", "z", "y", "x"]
+    shape = (1, 300, 300) if z_planes is None else (1, z_planes, 300, 300)
+    scale = {"y": 0.325, "x": 0.325}
+    translation = {"y": 0.0, "x": offset}
+    if z_planes is not None:
+        scale["z"] = 1.0
+        translation["z"] = 0.0
+    return si_utils.get_sim_from_array(
+        np.ones(shape, dtype=np.uint16),
+        dims=dims,
+        scale=scale,
+        translation=translation,
+        c_coords=["DAPI"],
+        transform_key="affine_registered",
+    )
+
+
+def test_output_chunksize_is_per_dimension():
+    """3D fusion gets its own chunk shape instead of a scalar on every axis."""
+    assert _output_chunksize([_chunk_test_sim(None)]) == {"y": 1024, "x": 1024}
+    assert _output_chunksize([_chunk_test_sim(40)]) == {"z": 16, "y": 256, "x": 256}
+
+
+def test_fused_3d_chunks_do_not_span_full_z():
+    """A 3D fused image must not be chunked as a single slab along z.
+
+    A scalar chunksize is expanded to every spatial dimension, so it asked for
+    z x 1024 x 1024 chunks - the whole z range at once, which is what made
+    fusing 3D data blow up in memory.
+    """
+    z_planes = 40
+    sims = [_chunk_test_sim(z_planes), _chunk_test_sim(z_planes, offset=50.0)]
+
+    fused = _fuse_masked(sims)  # lazy, nothing is computed here
+
+    chunks = fused.chunksizes
+    assert max(chunks["z"]) <= 16 < z_planes
+    assert max(chunks["y"]) <= 256
+    assert max(chunks["x"]) <= 256
 
 
 # ---------------------------------------------------------------------------

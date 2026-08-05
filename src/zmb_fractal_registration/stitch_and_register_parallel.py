@@ -49,6 +49,7 @@ from zmb_fractal_registration._stitch_register.pre_registration import (
 from zmb_fractal_registration._stitch_register.registration import (
     _collect_shifts,
     _detect_outlier_tiles,
+    _output_chunksize,
     _register_cycle_tiles,
     _register_leftover_tiles,
     _stitch_and_fuse_reference,
@@ -284,11 +285,12 @@ def _fuse_cycles(
     for cycle in cycles:
         logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
         cycle_sims = [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
+        chunksize = _output_chunksize(cycle_sims)
         sims_fused[cycle] = fusion.fuse(
             cycle_sims,
             transform_key="affine_registered",
             interpolation_order=interpolation_order,
-            output_chunksize=1024,
+            output_chunksize=chunksize,
             output_origin=global_origin,
             output_shape=global_shape,
         )
@@ -299,7 +301,7 @@ def _fuse_cycles(
                 transform_key="affine_registered",
                 fusion_func=fusion.max_fusion,
                 interpolation_order=interpolation_order,
-                output_chunksize=1024,
+                output_chunksize=chunksize,
                 output_origin=global_origin,
                 output_shape=global_shape,
             )
