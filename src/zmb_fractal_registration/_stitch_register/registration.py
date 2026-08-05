@@ -38,6 +38,8 @@ def _fuse_masked(
     has NaN outside the union of tile footprints and an additional `alias_key`
     transform alias pointing to `transform_key`, so that the fused image can be
     registered together with tiles that use `alias_key` as their input position.
+    Masking makes the result floating point (float32 for the usual integer
+    inputs, since NaN cannot be represented in an integer dtype).
 
     The output canvas defaults to the union of the input tiles; passing
     `output_origin`/`output_shape`/`output_spacing` fuses onto an explicitly
@@ -73,7 +75,11 @@ def _fuse_masked(
         **canvas_kwargs,
     )
     mask = mask.isel(c=0, drop=True)
-    sim_fused = xr.where(mask > 0, sim_fused, np.nan)
+    # np.float32 rather than a bare np.nan (a python float, i.e. float64): NaN
+    # forces a float dtype anyway, and multiview-stitcher casts to float32
+    # before registering, so float64 would only double the memory of every
+    # intermediate fused image for precision that is discarded downstream.
+    sim_fused = xr.where(mask > 0, sim_fused, np.float32(np.nan))
     sim_fused.transforms[alias_key] = sim_fused.transforms[transform_key]
     return sim_fused
 
