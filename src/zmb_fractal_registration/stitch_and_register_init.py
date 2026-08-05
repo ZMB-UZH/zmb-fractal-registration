@@ -76,6 +76,7 @@ def stitch_and_register_init(
     ),
     pyramid_level: int = 0,
     z_project: bool = True,
+    pre_registration: bool = False,
     tile_correction: TileCorrectionModel = TileCorrectionModel(),
     keep_original_acquisitions: bool = True,
     fusion_region: Literal["union", "intersection", "intersection_bbox"] = "union",
@@ -109,6 +110,15 @@ def stitch_and_register_init(
             and apply the calculated transformations to the full 3D image.
             If False, operate on the full image volume. Only used in case of
             3D images.
+        pre_registration: If True, perform a rough pre-registration of the
+            acquisitions before the accurate stitching and registration. Each
+            acquisition is fused from its original stage coordinates at the
+            coarsest pyramid level, and the fused acquisitions are registered
+            against the reference acquisition as a whole. Use this when the
+            shifts between acquisitions are large compared to the tile overlap
+            and are therefore not recoverable from the stage coordinates alone.
+            Assumes that all acquisitions cover roughly the same area; shifts
+            of any size are recoverable.
         tile_correction: Settings for correcting non-overlapping tiles and
             filtering outliers.
         keep_original_acquisitions: If True, keep original acquisitions after
@@ -227,6 +237,7 @@ def stitch_and_register_init(
                 "reference_channel": reference_channel.model_dump(),
                 "pyramid_level": pyramid_level,
                 "z_project": z_project,
+                "pre_registration": pre_registration,
                 "keep_original_acquisitions": keep_original_acquisitions,
                 "tile_correction": tile_correction.model_dump(),
                 "fusion_region": fusion_region,
