@@ -38,6 +38,7 @@ from zmb_fractal_registration._stitch_register.registration import (
     _detect_outlier_tiles,
     _fuse_masked,
     _output_chunksize,
+    _register_leftover_tiles,
 )
 from zmb_fractal_registration._stitch_register.sim_geometry import _xaffine_to_matrix
 from zmb_fractal_registration.stitch_and_register_init import (
@@ -464,8 +465,62 @@ def test_intersection_bbox_shape_exact_multiple_keeps_all_pixels():
 
 
 # ---------------------------------------------------------------------------
-# Unit tests for the fusion output chunking
+# Unit tests for leftover-tile correction
 # ---------------------------------------------------------------------------
+
+
+def _tile_msim(y: float, x: float, registered_shift: float | None = None):
+    """A 50x50 um tile at (y, x), optionally with an affine_registered transform.
+
+    The content is deliberately non-constant: multiview-stitcher short-circuits
+    pairwise registration of constant images, which would hide the code path
+    under test.
+    """
+    rng = np.random.default_rng(abs(int(y * 7 + x * 13)) + 1)
+    sim = si_utils.get_sim_from_array(
+        rng.integers(0, 4096, size=(1, 50, 50)).astype(np.uint16),
+        dims=["c", "y", "x"],
+        scale={"y": 1.0, "x": 1.0},
+        translation={"y": y, "x": x},
+        c_coords=["DAPI"],
+        transform_key="fractal_input",
+    )
+    msim = msi_utils.get_msim_from_sim(sim, scale_factors=[])
+    if registered_shift is not None:
+        msi_utils.set_affine_transform(
+            msim,
+            param_utils.affine_to_xaffine(
+                param_utils.affine_from_translation(
+                    [registered_shift, registered_shift]
+                ),
+                t_coords=[0],
+            ),
+            "affine_registered",
+        )
+    return msim
+
+
+def test_leftover_tile_in_hole_of_inlier_coverage(tmp_path: Path):
+    """A leftover tile inside the inliers' bounding box but not on any inlier.
+
+    The inliers sit diagonally, so the fused inlier image spans a box with a
+    hole in it. A leftover tile in that hole overlaps the fused image's bounding
+    box - so it is not caught as "not enough overlap" - while the pixels there
+    are all NaN. Phase correlation used to crash on that empty reference with
+    "zero-size array to reduction operation minimum".
+    """
+    # inliers on the diagonal, leftover in the empty off-diagonal corner
+    msims = [
+        _tile_msim(0.0, 0.0, registered_shift=1.0),
+        _tile_msim(0.0, 100.0),  # leftover, in the hole
+        _tile_msim(100.0, 100.0, registered_shift=1.0),
+    ]
+
+    _register_leftover_tiles(msims, {1}, "DAPI", "cycle1")
+
+    # It falls back to the mean inlier shift rather than raising. The tile's world
+    # position lives in its coordinates, so the transform holds the shift alone.
+    assert np.allclose(_translations([msims[1]], "affine_registered")[0], [1.0, 1.0])
 
 
 def _chunk_test_sim(z_planes: int | None, offset: float = 0.0):
