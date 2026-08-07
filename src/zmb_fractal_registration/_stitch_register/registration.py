@@ -450,13 +450,52 @@ def _register_leftover_tiles(
         _INIT_KEY,
     )
 
+    # Only re-register tiles that land on an actual inlier tile. The fused
+    # inlier image is NaN wherever no inlier tile is, but its *bounding box*
+    # covers those gaps too, so a tile seeded into such a gap passes
+    # multiview-stitcher's overlap check and then hands phase correlation an
+    # all-NaN reference, which it cannot handle.
+    inlier_msims = [msims[i] for i in ok_indices]
+    reregister_indices, isolated_indices = [], []
+    for tile_idx in sorted_tile_indices:
+        if _has_overlap_with_reference_tiles(
+            msims[tile_idx],
+            inlier_msims,
+            transform_key=_INIT_KEY,
+            ref_transform_key="affine_registered",
+        ):
+            reregister_indices.append(tile_idx)
+        else:
+            isolated_indices.append(tile_idx)
+
+    if isolated_indices:
+        logger.warning(
+            f"Cycle '{cycle}': {len(isolated_indices)} leftover tile(s) do not "
+            f"overlap any inlier tile even after the mean shift; keeping the mean "
+            f"inlier shift for them without re-registration."
+        )
+        _apply_mean_shift_to_tiles(
+            msims,
+            isolated_indices,
+            mean_shift,
+            ndim,
+            init_transform_key=init_transform_key,
+        )
+
+    if not reregister_indices:
+        logger.warning(
+            f"Cycle '{cycle}': no leftover tile overlaps an inlier tile; "
+            f"skipping re-registration."
+        )
+        return
+
     logger.info(
-        f"Cycle '{cycle}': re-registering {len(sorted_tile_indices)} leftover "
+        f"Cycle '{cycle}': re-registering {len(reregister_indices)} leftover "
         f"tile(s) against fused inlier image."
     )
     try:
         registration.register(
-            [msim_fused_inliers] + [msims[i] for i in sorted_tile_indices],
+            [msim_fused_inliers] + [msims[i] for i in reregister_indices],
             reg_channel=reg_channel,
             transform_key=_INIT_KEY,
             new_transform_key="affine_registered",
@@ -464,14 +503,16 @@ def _register_leftover_tiles(
             groupwise_resolution_kwargs={"reference_view": 0},
             reg_res_level=0,
         )
-    except mv_graph.NotEnoughOverlapError:
+    # ValueError covers phase correlation choking on a degenerate overlap region
+    # (e.g. an all-NaN reference), which must not take the whole well down.
+    except (mv_graph.NotEnoughOverlapError, ValueError) as exc:
         logger.warning(
-            f"Cycle '{cycle}': leftover tile registration failed (not enough overlap "
-            f"with fused inlier); falling back to mean inlier shift."
+            f"Cycle '{cycle}': leftover tile registration failed ({exc}); "
+            f"falling back to mean inlier shift."
         )
         _apply_mean_shift_to_tiles(
             msims,
-            sorted_tile_indices,
+            reregister_indices,
             mean_shift,
             ndim,
             init_transform_key=init_transform_key,
