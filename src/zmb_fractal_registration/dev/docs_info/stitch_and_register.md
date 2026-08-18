@@ -22,7 +22,7 @@ Key features:
 
 ### Outputs
 
-Creates a **new OME-Zarr plate**, named after the original with `new_plate_suffix` appended (default: `plate.zarr` → `plate_fused.zarr`), holding one fused image per well under a single acquisition named `fused`. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.
+Creates a **new OME-Zarr plate**, named after the original with `new_plate_suffix` appended (default: `plate.zarr` -> `plate_fused.zarr`), holding one fused image per well under a single acquisition named `fused`. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.
 
 After registration the cycles rarely cover exactly the same area, so `fusion_region` selects which part of that area is written:
 
