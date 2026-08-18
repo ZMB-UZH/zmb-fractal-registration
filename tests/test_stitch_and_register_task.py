@@ -15,9 +15,13 @@ from ngio import (
     open_ome_zarr_container,
     open_ome_zarr_plate,
 )
+from ngio.ome_zarr_meta import Channel
 from ngio.tables import RoiTable
 
-from zmb_fractal_registration._stitch_register.loading import _get_msims
+from zmb_fractal_registration._stitch_register.loading import (
+    _get_msims,
+    _resolve_registration_channel,
+)
 from zmb_fractal_registration._stitch_register.output_bbox import (
     _compute_global_bbox,
     _coverage_cell_grid,
@@ -36,6 +40,7 @@ from zmb_fractal_registration._stitch_register.pre_registration import (
     _shared_canvas_shape,
 )
 from zmb_fractal_registration._stitch_register.registration import (
+    _MAX_CHUNK_VOXELS,
     _detect_outlier_tiles,
     _fuse_masked,
     _output_chunksize,
@@ -561,35 +566,21 @@ def test_registration_chunksize_has_a_floor():
     assert _registration_chunksize([tiny]) == {"y": 64, "x": 64}
 
 
-def test_registration_chunksize_caps_large_tiles():
+@pytest.mark.parametrize("tile_shape", [(1, 50, 2048, 2048), (1, 1, 8000, 8000)])
+def test_registration_chunksize_caps_large_tiles(tile_shape):
     """A full-resolution tile is too big to use as a chunk verbatim.
 
     Without the cap a 2048x2048x50 tile would ask for a 200M-voxel chunk, which
     holds several GB once the overlapping tiles are resampled into it.
     """
-    big = si_utils.get_sim_from_array(
-        np.ones((1, 50, 2048, 2048), dtype=np.uint16),
-        dims=["c", "z", "y", "x"],
-        scale={"z": 1.0, "y": 0.325, "x": 0.325},
-        c_coords=["DAPI"],
-        transform_key="affine_registered",
-    )
-    chunks = _registration_chunksize([big])
+    assert np.prod(tile_shape) > _MAX_CHUNK_VOXELS, "tile must exceed the budget"
+    chunks = _registration_chunksize([_dask_tile(tile_shape, shape=tile_shape)])
 
-    assert np.prod(list(chunks.values())) <= 2**20
-    # still smaller than the tile in every dimension, so a chunk cannot span
+    assert np.prod(list(chunks.values())) <= _MAX_CHUNK_VOXELS
+    # still no larger than the tile in any dimension, so a chunk cannot span
     # more than one tile
-    for dim, size in {"z": 50, "y": 2048, "x": 2048}.items():
-        assert chunks[dim] <= size
-
-
-def test_registration_chunksize_caps_3d_tiles():
-    """A 3D tile blows the voxel budget well before a 2D one does."""
-    chunks = _registration_chunksize([_chunk_test_sim(40)])
-
-    assert np.prod(list(chunks.values())) <= 2**20
-    for dim, size in {"z": 40, "y": 300, "x": 300}.items():
-        assert chunks[dim] < size
+    for dim, size in zip(["z", "y", "x"], tile_shape[1:], strict=True):
+        assert chunks[dim] <= max(size, 64)
 
 
 def _dask_tile(chunks: tuple[int, ...], shape=(1, 40, 300, 300)):
@@ -634,7 +625,7 @@ def test_output_chunksize_caps_pathological_input_chunking():
     )
 
     # z is already 1 and cannot shrink, so y and x must absorb the whole cap
-    assert np.prod(list(chunks.values())) <= 2**20
+    assert np.prod(list(chunks.values())) <= _MAX_CHUNK_VOXELS
     assert chunks["z"] == 1
 
 
@@ -1045,6 +1036,117 @@ def test_pre_registration_task(tmp_path: Path):
     assert len(fused_images) == 1
     fused_image = fused_images[0].get_image()
     assert len(fused_image.channel_labels) == 2
+
+
+# Labels and wavelength IDs are deliberately disjoint: a wavelength ID must not
+# also be a valid label, or looking one up as the other would appear to work.
+_WAVELENGTH_CHANNELS = [
+    ("Hoechst", "465"),
+    ("CD45", "647"),
+]
+
+
+def _create_plate_with_wavelength_ids(plate_path: Path) -> list[str]:
+    """A plate whose channels carry wavelength IDs distinct from their labels."""
+    img_shape = (len(_WAVELENGTH_CHANNELS), _FOV_PX, 2 * _FOV_PX - _OVERLAP_PX)
+    fov_size_um = _FOV_PX * _PIXEL_SIZE
+    overlap_um = _OVERLAP_PX * _PIXEL_SIZE
+
+    plate = create_empty_plate(
+        store=plate_path,
+        name="test_plate",
+        images=[
+            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
+            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
+        ],
+        overwrite=True,
+    )
+
+    zarr_urls = []
+    for img_rel_path in plate.images_paths():
+        img_path = plate_path / img_rel_path
+        container = create_synthetic_ome_zarr(
+            store=img_path,
+            shape=img_shape,
+            axes_names="cyx",
+            channels_meta=[
+                Channel.default_init(label=label, wavelength_id=wavelength_id)
+                for label, wavelength_id in _WAVELENGTH_CHANNELS
+            ],
+            overwrite=True,
+        )
+        rois = [
+            Roi.from_values(
+                slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
+                name="FOV_1",
+                y_micrometer_original=0.0,
+                x_micrometer_original=0.0,
+            ),
+            Roi.from_values(
+                slices={
+                    "y": (0.0, fov_size_um),
+                    "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
+                },
+                name="FOV_2",
+                y_micrometer_original=0.0,
+                x_micrometer_original=fov_size_um - overlap_um,
+            ),
+        ]
+        container.add_table("FOV_ROI_table", RoiTable(rois=rois))
+        zarr_urls.append(str(img_path))
+
+    return zarr_urls
+
+
+def test_resolve_registration_channel_by_wavelength_id(tmp_path: Path):
+    """A wavelength_id selector resolves via the wavelength, not the label.
+
+    ngio's get_channel_idx takes (channel_label, wavelength_id), so passing the
+    identifier positionally silently looks a wavelength ID up as a label and
+    fails with "Channel with label 465 not found".
+    """
+    zarr_urls = _create_plate_with_wavelength_ids(tmp_path / "wavelength.zarr")
+    image = open_ome_zarr_container(zarr_urls[0]).get_image()
+
+    for label, wavelength_id in _WAVELENGTH_CHANNELS:
+        assert wavelength_id not in image.channel_labels  # the test would be vacuous
+        selector = ChannelSelectionModel(mode="wavelength_id", identifier=wavelength_id)
+        assert _resolve_registration_channel(image, selector) == label
+
+
+def test_resolve_registration_channel_by_label_and_index(tmp_path: Path):
+    """The other two selector modes keep resolving to the same labels."""
+    zarr_urls = _create_plate_with_wavelength_ids(tmp_path / "wavelength.zarr")
+    image = open_ome_zarr_container(zarr_urls[0]).get_image()
+
+    for idx, (label, _) in enumerate(_WAVELENGTH_CHANNELS):
+        by_index = ChannelSelectionModel(mode="index", identifier=str(idx))
+        by_label = ChannelSelectionModel(mode="label", identifier=label)
+        assert _resolve_registration_channel(image, by_index) == label
+        assert _resolve_registration_channel(image, by_label) == label
+
+
+def test_stitch_and_register_with_wavelength_id_channel(tmp_path: Path):
+    """The whole task runs when the registration channel is given as a wavelength."""
+    plate_path = tmp_path / "wavelength_task.zarr"
+    zarr_urls = _create_plate_with_wavelength_ids(plate_path)
+
+    result = stitch_and_register_init(
+        zarr_urls=zarr_urls,
+        zarr_dir=str(tmp_path),
+        reference_channel=ChannelSelectionModel(mode="wavelength_id", identifier="465"),
+    )
+    for item in result["parallelization_list"]:
+        stitch_and_register_parallel(
+            zarr_url=item["zarr_url"], init_args=item["init_args"]
+        )
+
+    plate = open_ome_zarr_plate(plate_path)
+    fused = next(
+        iter(plate.get_images(acquisition=max(plate.acquisition_ids)).values())
+    ).get_image()
+    # 2 channels x 2 cycles
+    assert len(fused.channel_labels) == 4
 
 
 def _create_plate_with_mismatched_channels(plate_path: Path) -> list[str]:

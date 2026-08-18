@@ -42,7 +42,9 @@ _MIN_CHUNKSIZE = 64
 # Upper bound on the voxels in one chunk, so that a chunk stays small in
 # absolute terms even where a tile does not: at full resolution a tile can be
 # millions of voxels, and tracking it exactly would undo the point of chunking.
-# 2**24 is what the previous fixed 1024x1024 chunks held in 2D.
+# 2**24 is a 4096x4096 chunk in 2D, i.e. 16x what the previous fixed 1024x1024
+# chunks held. A chunk holds a few overlapping tiles at once while it is fused,
+# each resampled to float32, so this is roughly 64 MB per tile in the chunk.
 _MAX_CHUNK_VOXELS = 2**24
 
 

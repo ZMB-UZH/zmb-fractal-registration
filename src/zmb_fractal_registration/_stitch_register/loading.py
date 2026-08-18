@@ -57,7 +57,9 @@ def _resolve_registration_channel(image, selector: ChannelSelectionModel) -> str
     if selector.mode == "index":
         return image.channel_labels[int(selector.identifier)]
     if selector.mode == "wavelength_id":
-        idx = image.get_channel_idx(selector.identifier)
+        # Keyword, not positional: get_channel_idx takes (channel_label,
+        # wavelength_id), so a positional identifier is looked up as a label.
+        idx = image.get_channel_idx(wavelength_id=selector.identifier)
         return image.channel_labels[idx]
     return selector.identifier
 
