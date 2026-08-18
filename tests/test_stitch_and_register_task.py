@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import dask.array as da
 import numpy as np
 import pytest
 from multiview_stitcher import msi_utils, param_utils
@@ -14,9 +15,13 @@ from ngio import (
     open_ome_zarr_container,
     open_ome_zarr_plate,
 )
+from ngio.ome_zarr_meta import Channel
 from ngio.tables import RoiTable
 
-from zmb_fractal_registration._stitch_register.loading import _get_msims
+from zmb_fractal_registration._stitch_register.loading import (
+    _get_msims,
+    _resolve_registration_channel,
+)
 from zmb_fractal_registration._stitch_register.output_bbox import (
     _compute_global_bbox,
     _coverage_cell_grid,
@@ -35,10 +40,12 @@ from zmb_fractal_registration._stitch_register.pre_registration import (
     _shared_canvas_shape,
 )
 from zmb_fractal_registration._stitch_register.registration import (
+    _MAX_CHUNK_VOXELS,
     _detect_outlier_tiles,
     _fuse_masked,
     _output_chunksize,
     _register_leftover_tiles,
+    _registration_chunksize,
 )
 from zmb_fractal_registration._stitch_register.sim_geometry import _xaffine_to_matrix
 from zmb_fractal_registration.stitch_and_register_init import (
@@ -542,28 +549,107 @@ def _chunk_test_sim(z_planes: int | None, offset: float = 0.0):
     )
 
 
-def test_output_chunksize_is_per_dimension():
-    """3D fusion gets its own chunk shape instead of a scalar on every axis."""
-    assert _output_chunksize([_chunk_test_sim(None)]) == {"y": 1024, "x": 1024}
-    assert _output_chunksize([_chunk_test_sim(40)]) == {"z": 16, "y": 256, "x": 256}
+def test_registration_chunksize_tracks_the_tile_size():
+    """A tile that fits the voxel budget is used as the chunk verbatim."""
+    assert _registration_chunksize([_chunk_test_sim(None)]) == {"y": 300, "x": 300}
 
 
-def test_fused_3d_chunks_do_not_span_full_z():
-    """A 3D fused image must not be chunked as a single slab along z.
+def test_registration_chunksize_has_a_floor():
+    """Tiny tiles (coarse pyramid levels) do not produce tiny chunks."""
+    tiny = si_utils.get_sim_from_array(
+        np.ones((1, 8, 8), dtype=np.uint16),
+        dims=["c", "y", "x"],
+        scale={"y": 1.0, "x": 1.0},
+        c_coords=["DAPI"],
+        transform_key="affine_registered",
+    )
+    assert _registration_chunksize([tiny]) == {"y": 64, "x": 64}
 
-    A scalar chunksize is expanded to every spatial dimension, so it asked for
-    z x 1024 x 1024 chunks - the whole z range at once, which is what made
-    fusing 3D data blow up in memory.
+
+@pytest.mark.parametrize("tile_shape", [(1, 50, 2048, 2048), (1, 1, 8000, 8000)])
+def test_registration_chunksize_caps_large_tiles(tile_shape):
+    """A full-resolution tile is too big to use as a chunk verbatim.
+
+    Without the cap a 2048x2048x50 tile would ask for a 200M-voxel chunk, which
+    holds several GB once the overlapping tiles are resampled into it.
     """
-    z_planes = 40
-    sims = [_chunk_test_sim(z_planes), _chunk_test_sim(z_planes, offset=50.0)]
+    assert np.prod(tile_shape) > _MAX_CHUNK_VOXELS, "tile must exceed the budget"
+    chunks = _registration_chunksize([_dask_tile(tile_shape, shape=tile_shape)])
 
-    fused = _fuse_masked(sims)  # lazy, nothing is computed here
+    assert np.prod(list(chunks.values())) <= _MAX_CHUNK_VOXELS
+    # still no larger than the tile in any dimension, so a chunk cannot span
+    # more than one tile
+    for dim, size in zip(["z", "y", "x"], tile_shape[1:], strict=True):
+        assert chunks[dim] <= max(size, 64)
 
-    chunks = fused.chunksizes
-    assert max(chunks["z"]) <= 16 < z_planes
-    assert max(chunks["y"]) <= 256
-    assert max(chunks["x"]) <= 256
+
+def _dask_tile(chunks: tuple[int, ...], shape=(1, 40, 300, 300)):
+    """A 3D tile backed by a dask array with an explicit chunking."""
+    return si_utils.get_sim_from_array(
+        da.ones(shape, dtype=np.uint16, chunks=chunks),
+        dims=["c", "z", "y", "x"],
+        scale={"z": 1.0, "y": 0.325, "x": 0.325},
+        c_coords=["DAPI"],
+        transform_key="affine_registered",
+    )
+
+
+def test_output_chunksize_inherits_the_input_chunking():
+    """The fused output is chunked like the tiles it was built from.
+
+    This size is also written as the on-disk chunking of the output OME-Zarr,
+    so it should follow the input rather than a number derived from a memory
+    budget.
+    """
+    assert _output_chunksize([_dask_tile((1, 10, 128, 128))]) == {
+        "z": 10,
+        "y": 128,
+        "x": 128,
+    }
+    # a store written one z-plane at a time, which is a common OME-Zarr layout
+    assert _output_chunksize([_dask_tile((1, 1, 256, 256))]) == {
+        "z": 1,
+        "y": 256,
+        "x": 256,
+    }
+
+
+def test_output_chunksize_caps_pathological_input_chunking():
+    """A store with huge chunks must not dictate a huge fusion chunk.
+
+    A whole-plane chunk would hold gigabytes once every overlapping tile is
+    resampled into it, so the inherited size is still capped.
+    """
+    chunks = _output_chunksize(
+        [_dask_tile((1, 1, 5000, 5000), shape=(1, 1, 5000, 5000))]
+    )
+
+    # z is already 1 and cannot shrink, so y and x must absorb the whole cap
+    assert np.prod(list(chunks.values())) <= _MAX_CHUNK_VOXELS
+    assert chunks["z"] == 1
+
+
+def test_output_chunksize_falls_back_for_numpy_tiles():
+    """A tile that is not a chunked array falls back to the tile shape."""
+    assert _output_chunksize([_chunk_test_sim(None)]) == {"y": 300, "x": 300}
+
+
+def test_fused_chunks_never_exceed_the_tile_size():
+    """No fused chunk may span more than one tile, in any dimension.
+
+    A chunk larger than a tile pulls ~(chunk/tile)**2 tiles into memory at once
+    when it is fused. An absolute chunk size cannot guarantee this, because a
+    tile is a different number of pixels at every pyramid level - which is how
+    a whole fused reference once ended up inside a single chunk.
+    """
+    for z_planes in (None, 40):
+        sims = [_chunk_test_sim(z_planes), _chunk_test_sim(z_planes, offset=50.0)]
+        tile_shape = si_utils.get_shape_from_sim(sims[0], asarray=False)
+
+        fused = _fuse_masked(sims)  # lazy, nothing is computed here
+
+        for dim, tile_size in tile_shape.items():
+            assert max(fused.chunksizes[dim]) <= max(tile_size, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -950,6 +1036,117 @@ def test_pre_registration_task(tmp_path: Path):
     assert len(fused_images) == 1
     fused_image = fused_images[0].get_image()
     assert len(fused_image.channel_labels) == 2
+
+
+# Labels and wavelength IDs are deliberately disjoint: a wavelength ID must not
+# also be a valid label, or looking one up as the other would appear to work.
+_WAVELENGTH_CHANNELS = [
+    ("Hoechst", "465"),
+    ("CD45", "647"),
+]
+
+
+def _create_plate_with_wavelength_ids(plate_path: Path) -> list[str]:
+    """A plate whose channels carry wavelength IDs distinct from their labels."""
+    img_shape = (len(_WAVELENGTH_CHANNELS), _FOV_PX, 2 * _FOV_PX - _OVERLAP_PX)
+    fov_size_um = _FOV_PX * _PIXEL_SIZE
+    overlap_um = _OVERLAP_PX * _PIXEL_SIZE
+
+    plate = create_empty_plate(
+        store=plate_path,
+        name="test_plate",
+        images=[
+            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
+            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
+        ],
+        overwrite=True,
+    )
+
+    zarr_urls = []
+    for img_rel_path in plate.images_paths():
+        img_path = plate_path / img_rel_path
+        container = create_synthetic_ome_zarr(
+            store=img_path,
+            shape=img_shape,
+            axes_names="cyx",
+            channels_meta=[
+                Channel.default_init(label=label, wavelength_id=wavelength_id)
+                for label, wavelength_id in _WAVELENGTH_CHANNELS
+            ],
+            overwrite=True,
+        )
+        rois = [
+            Roi.from_values(
+                slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
+                name="FOV_1",
+                y_micrometer_original=0.0,
+                x_micrometer_original=0.0,
+            ),
+            Roi.from_values(
+                slices={
+                    "y": (0.0, fov_size_um),
+                    "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
+                },
+                name="FOV_2",
+                y_micrometer_original=0.0,
+                x_micrometer_original=fov_size_um - overlap_um,
+            ),
+        ]
+        container.add_table("FOV_ROI_table", RoiTable(rois=rois))
+        zarr_urls.append(str(img_path))
+
+    return zarr_urls
+
+
+def test_resolve_registration_channel_by_wavelength_id(tmp_path: Path):
+    """A wavelength_id selector resolves via the wavelength, not the label.
+
+    ngio's get_channel_idx takes (channel_label, wavelength_id), so passing the
+    identifier positionally silently looks a wavelength ID up as a label and
+    fails with "Channel with label 465 not found".
+    """
+    zarr_urls = _create_plate_with_wavelength_ids(tmp_path / "wavelength.zarr")
+    image = open_ome_zarr_container(zarr_urls[0]).get_image()
+
+    for label, wavelength_id in _WAVELENGTH_CHANNELS:
+        assert wavelength_id not in image.channel_labels  # the test would be vacuous
+        selector = ChannelSelectionModel(mode="wavelength_id", identifier=wavelength_id)
+        assert _resolve_registration_channel(image, selector) == label
+
+
+def test_resolve_registration_channel_by_label_and_index(tmp_path: Path):
+    """The other two selector modes keep resolving to the same labels."""
+    zarr_urls = _create_plate_with_wavelength_ids(tmp_path / "wavelength.zarr")
+    image = open_ome_zarr_container(zarr_urls[0]).get_image()
+
+    for idx, (label, _) in enumerate(_WAVELENGTH_CHANNELS):
+        by_index = ChannelSelectionModel(mode="index", identifier=str(idx))
+        by_label = ChannelSelectionModel(mode="label", identifier=label)
+        assert _resolve_registration_channel(image, by_index) == label
+        assert _resolve_registration_channel(image, by_label) == label
+
+
+def test_stitch_and_register_with_wavelength_id_channel(tmp_path: Path):
+    """The whole task runs when the registration channel is given as a wavelength."""
+    plate_path = tmp_path / "wavelength_task.zarr"
+    zarr_urls = _create_plate_with_wavelength_ids(plate_path)
+
+    result = stitch_and_register_init(
+        zarr_urls=zarr_urls,
+        zarr_dir=str(tmp_path),
+        reference_channel=ChannelSelectionModel(mode="wavelength_id", identifier="465"),
+    )
+    for item in result["parallelization_list"]:
+        stitch_and_register_parallel(
+            zarr_url=item["zarr_url"], init_args=item["init_args"]
+        )
+
+    plate = open_ome_zarr_plate(plate_path)
+    fused = next(
+        iter(plate.get_images(acquisition=max(plate.acquisition_ids)).values())
+    ).get_image()
+    # 2 channels x 2 cycles
+    assert len(fused.channel_labels) == 4
 
 
 def _create_plate_with_mismatched_channels(plate_path: Path) -> list[str]:

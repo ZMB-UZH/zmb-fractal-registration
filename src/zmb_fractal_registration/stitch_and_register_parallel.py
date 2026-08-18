@@ -5,13 +5,15 @@
 #   positions in metadata
 # - add option to input different ROI table
 # - optimize dask parallelization
-# - Step 4 recomputes the fused reference once per tile: _register_cycle_tiles
-#   passes a fresh msi_utils.get_msim_from_sim(sim_fused_ref) into every delayed
-#   register task, and the lazy fused reference is not shared between them
-#   (measured: 3 executions of its 1-block dask graph for 2 registered tiles).
-#   Computing it once before the loop should remove that cost - the
-#   pre-registration step already does this, via .compute() on its fused
-#   reference, so that it is loaded into memory only once.
+# - consider materializing intermediate fused images to a temporary zarr instead
+#   of holding them in memory. The fused reference in Steps 3-4 stays lazy and
+#   is only ever computed chunk-wise, but the pre-registration in Step 2
+#   computes one shared canvas into memory, and each cycle's chunks are
+#   recomputed once per tile registered against them (dask cannot share results
+#   across the delayed tasks, since register() computes internally). Writing
+#   those to scratch with da.store and reading them back lazily would remove the
+#   recomputation and bound the memory at any pyramid level, at the cost of disk
+#   I/O and temp-file handling.
 # - interpolation_order=0 leaves a 1-pixel zero frame around the outer edge of a
 #   fused cycle whenever the output canvas is not aligned to that cycle's pixel
 #   grid (i.e. whenever the registration shift is sub-pixel). The frame follows
@@ -285,7 +287,10 @@ def _fuse_cycles(
     for cycle in cycles:
         logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
         cycle_sims = [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
+        # Inherited from the input tiles, so the output is chunked like the
+        # images it was built from (this is also the on-disk chunking).
         chunksize = _output_chunksize(cycle_sims)
+        logger.info(f"Cycle '{cycle}': output chunks {chunksize}.")
         sims_fused[cycle] = fusion.fuse(
             cycle_sims,
             transform_key="affine_registered",
