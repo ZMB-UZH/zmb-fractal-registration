@@ -18,6 +18,9 @@ from ngio import (
 from ngio.ome_zarr_meta import Channel
 from ngio.tables import RoiTable
 
+from zmb_fractal_registration._stitch_register.grid_snap import (
+    _snap_msims_to_output_grid,
+)
 from zmb_fractal_registration._stitch_register.loading import (
     _get_msims,
     _resolve_registration_channel,
@@ -53,6 +56,7 @@ from zmb_fractal_registration.stitch_and_register_init import (
     stitch_and_register_init,
 )
 from zmb_fractal_registration.stitch_and_register_parallel import (
+    _fuse_cycles,
     stitch_and_register_parallel,
 )
 
@@ -632,6 +636,77 @@ def test_fused_chunks_never_exceed_the_tile_size():
 
         for dim, tile_size in tile_shape.items():
             assert max(fused.chunksizes[dim]) <= max(tile_size, 64)
+
+
+# ---------------------------------------------------------------------------
+# Order-0 fusion: grid snapping
+# ---------------------------------------------------------------------------
+
+_SNAP_S = 0.325
+_SNAP_BASE = 98765.43  # plate-scale stage coordinate in um
+
+
+def _uniform_tile_msim(value: int, y: float, x: float, n: int = 64):
+    """A constant-valued chunked tile at (y, x) with the position in its coords."""
+    sim = si_utils.get_sim_from_array(
+        da.full((1, n, n), value, dtype=np.uint16, chunks=(1, 16, 16)),
+        dims=["c", "y", "x"],
+        scale={"y": _SNAP_S, "x": _SNAP_S},
+        translation={"y": y, "x": x},
+        c_coords=["ch"],
+        transform_key="affine_registered",
+    )
+    return msi_utils.get_msim_from_sim(sim, scale_factors=[])
+
+
+def test_snap_msims_to_output_grid_properties():
+    """Snapping rebases to a local frame and moves tiles by at most half a pixel."""
+    sub = 0.31 * _SNAP_S
+    msims = {
+        "A": [_uniform_tile_msim(100, _SNAP_BASE, _SNAP_BASE)],
+        "B": [
+            _uniform_tile_msim(200, _SNAP_BASE + sub, _SNAP_BASE + 2 * _SNAP_S + sub)
+        ],
+    }
+    spacing_ref = {"y": _SNAP_S, "x": _SNAP_S}
+
+    snapped = _snap_msims_to_output_grid(msims, ["A", "B"], spacing_ref)
+
+    # Anchored at the lowest tile corner; the 0.31 px offsets round down, the
+    # 2.31 px offset rounds to 2 px.
+    for cycle, k_exp in [("A", {"y": 0, "x": 0}), ("B", {"y": 0, "x": 2})]:
+        sim = msi_utils.get_sim_from_msim(snapped[cycle][0])
+        origin = si_utils.get_origin_from_sim(sim, asarray=False)
+        for dim in ("y", "x"):
+            assert origin[dim] == k_exp[dim] * _SNAP_S
+
+
+def test_order0_fusion_is_exact_after_grid_snapping():
+    """intersection_bbox at order 0 contains only original pixel values.
+
+    Tiles at plate-scale world coordinates with sub-pixel registration shifts
+    used to come out of the order-0 fusion with one-pixel zero seams at chunk
+    borders and the canvas edge (and off-by-one values elsewhere); with grid
+    snapping the fusion is an exact integer-shift mosaic.
+    """
+    from types import SimpleNamespace
+
+    sub = 0.31 * _SNAP_S
+    msims_fusion = {
+        "A": [_uniform_tile_msim(100, _SNAP_BASE, _SNAP_BASE)],
+        "B": [_uniform_tile_msim(200, _SNAP_BASE + sub, _SNAP_BASE + sub)],
+    }
+    # _fuse_cycles only uses the reference container for the axes lookup.
+    containers = {
+        "A": SimpleNamespace(get_image=lambda: SimpleNamespace(axes=["c", "y", "x"]))
+    }
+
+    fused = _fuse_cycles(
+        containers, msims_fusion, ["A", "B"], "A", "intersection_bbox", 0
+    )
+
+    arr = np.asarray(fused.data)
+    assert sorted(np.unique(arr).tolist()) == [100, 200]
 
 
 # ---------------------------------------------------------------------------

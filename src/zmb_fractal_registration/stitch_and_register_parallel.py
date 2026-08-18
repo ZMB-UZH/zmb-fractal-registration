@@ -14,17 +14,18 @@
 #   those to scratch with da.store and reading them back lazily would remove the
 #   recomputation and bound the memory at any pyramid level, at the cost of disk
 #   I/O and temp-file handling.
-# - interpolation_order=0 leaves a 1-pixel zero frame around the outer edge of a
-#   fused cycle whenever the output canvas is not aligned to that cycle's pixel
-#   grid (i.e. whenever the registration shift is sub-pixel). The frame follows
-#   the canvas edge, not the tile edge, so shrinking the output box does not
-#   remove it - meaning fusion_region='intersection_bbox' cannot fully guarantee
-#   "no pixels set to 0" at order 0. order=1 is unaffected. Fixing it likely
-#   means snapping global_origin onto the reference cycle's pixel grid (which
-#   would also stop order-0 nearest-neighbour from introducing up to half a
-#   pixel of jitter per tile), though non-reference cycles cannot be aligned at
-#   the same time. Possibly an off-by-one in multiview-stitcher's order-0
-#   resampling path - worth checking upstream first.
+# - report upstream (multiview-stitcher): at interpolation_order=0 the per-chunk
+#   tile crop in fusion has `interpolation_order` (i.e. zero) pixels of margin
+#   and scipy maps coordinates even slightly outside the crop to cval, which
+#   produces one-pixel zero seams at chunk borders and the canvas edge whenever
+#   a tile sits at a sub-pixel offset - and, at plate-scale world coordinates
+#   (~1e5 um), even when it does not, since float error exceeds the 10-decimal
+#   rounding of the resampling offsets (likely their "empty z slices in a
+#   fractal task" mystery). The `overlap_in_pixels` fuse() parameter is also
+#   ignored (unconditionally overwritten). The *output* fusion is immune here
+#   thanks to grid snapping (see grid_snap.py), but the order-0 registration
+#   reference fusions (_fuse_masked) can still carry 1-px NaN seams at chunk
+#   borders, which marginally weakens registration.
 
 import logging
 from pathlib import Path
@@ -37,6 +38,9 @@ from ngio import ChannelSelectionModel, open_ome_zarr_container
 from ngio.ome_zarr_meta import Channel
 from pydantic import BaseModel, validate_call
 
+from zmb_fractal_registration._stitch_register.grid_snap import (
+    _snap_msims_to_output_grid,
+)
 from zmb_fractal_registration._stitch_register.loading import (
     _get_msims,
     _resolve_registration_channel,
@@ -271,6 +275,12 @@ def _fuse_cycles(
     spacing_ref = get_spacing_from_sim(
         msi_utils.get_sim_from_msim(msims_fusion[ref_cycle][0]), asarray=False
     )
+    if interpolation_order == 0:
+        # Order 0 only preserves original pixel values (and avoids one-pixel
+        # zero seams) if the tiles sit exactly on the output grid; see
+        # grid_snap for the details. The bbox below is computed from the
+        # snapped positions, so the canvas lands on the same lattice.
+        msims_fusion = _snap_msims_to_output_grid(msims_fusion, cycles, spacing_ref)
     global_origin, global_shape = _compute_global_bbox(
         msims_fusion, cycles, spacing_ref, fusion_region
     )
