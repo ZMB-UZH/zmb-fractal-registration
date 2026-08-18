@@ -4,7 +4,12 @@ import logging
 from pathlib import Path
 from typing import Literal, Optional
 
-from ngio import ChannelSelectionModel, open_ome_zarr_plate
+from ngio import (
+    ChannelSelectionModel,
+    ImageInWellPath,
+    create_empty_plate,
+    open_ome_zarr_plate,
+)
 from pydantic import BaseModel, ConfigDict, model_validator, validate_call
 
 
@@ -85,11 +90,11 @@ def stitch_and_register_init(
     reference_channel: ChannelSelectionModel = ChannelSelectionModel(
         mode="index", identifier="0"
     ),
+    new_plate_suffix: str = "fused",
     pyramid_level: int = 0,
     z_project: bool = True,
-    pre_registration: bool = False,
+    pre_registration: bool = True,
     tile_correction: TileCorrectionModel = TileCorrectionModel(),
-    keep_original_acquisitions: bool = True,
     fusion_region: Literal["union", "intersection", "intersection_bbox"] = "union",
     interpolation_order: int = 0,
 ):
@@ -102,11 +107,15 @@ def stitch_and_register_init(
     to the reference image. This workflow is similar to what the Ashlar package
     does https://github.com/labsyspharm/ashlar, but also works in 3D.
 
+    The fused output is written to a new plate (named after the original with
+    `new_plate_suffix` appended); the original plate is not modified.
+
     Args:
         zarr_urls: List of paths or urls to the individual OME-Zarr images to
             be processed.
             (Standard argument for Fractal tasks, managed by Fractal server).
-        zarr_dir: Not used for this task.
+        zarr_dir: Directory in which the new plate holding the fused output is
+            created.
             (Standard argument for Fractal tasks, managed by Fractal server).
         acquisitions_to_include: Selection of acquisitions to process. If
             `use_all_acquisitions` is True (default), all acquisitions in the
@@ -116,24 +125,20 @@ def stitch_and_register_init(
             registration.
         reference_channel: Channel to use as reference for stitching and
             registration.
+        new_plate_suffix: Suffix for the new plate holding the fused output:
+            the fused images of `plate.zarr` are written to
+            `plate_{new_plate_suffix}.zarr` inside `zarr_dir`. An existing
+            plate at that path is overwritten.
         pyramid_level: Pyramid level to use for stitching and registration.
         z_project: If True, calculate stitching/registration on a z-projection
             and apply the calculated transformations to the full 3D image.
             If False, operate on the full image volume. Only used in case of
             3D images.
         pre_registration: If True, perform a rough pre-registration of the
-            acquisitions before the accurate stitching and registration. Each
-            acquisition is fused from its original stage coordinates at the
-            coarsest pyramid level, and the fused acquisitions are registered
-            against the reference acquisition as a whole. Use this when the
-            shifts between acquisitions are large compared to the tile overlap
-            and are therefore not recoverable from the stage coordinates alone.
-            Assumes that all acquisitions cover roughly the same area; shifts
-            of any size are recoverable.
+            acquisitions before the accurate stitching and registration. Use
+            this if there are significant global shifts between acquisitions.
         tile_correction: Settings for correcting non-overlapping tiles and
             filtering outliers.
-        keep_original_acquisitions: If True, keep original acquisitions after
-            registration. If False, remove them.
         fusion_region: Which region of the registered cycles to save.
             'union': save the full extent covered by any cycle.
             'intersection': tight box of the region covered by every cycle;
@@ -146,6 +151,9 @@ def stitch_and_register_init(
     """
     # TODO: Currently, we ignore the zarr_urls, and process all acquisitions found in
     # the plate. -> think about how to filter the acquisitions based on the zarr_urls
+
+    if not new_plate_suffix:
+        raise ValueError("`new_plate_suffix` must not be empty.")
 
     zarr_paths = [Path(url) for url in zarr_urls]
     # extract all plate roots
@@ -190,21 +198,14 @@ def stitch_and_register_init(
             acquisition_ids_filtered.append(reference_acquisition.acquisition_ID)
             cycle_names.append(reference_acquisition.cycle_name)
 
-        # Create a single merged output acquisition.
-        new_acquisition_id = max(acquisition_ids) + 1
-        ome_zarr_plate.add_acquisition(new_acquisition_id, "fused")
-        logging.info(
-            f"New combined acquisition will have ID {new_acquisition_id} and name "
-            "'fused'."
-        )
-
+        # Collect and validate the input image per acquisition for every well.
+        wells = []
         for well_path in ome_zarr_plate.wells_paths():
-            row = well_path.split("/")[0]
-            column = int(well_path.split("/")[1])
+            row, column = well_path.split("/")
             acquisition_paths = []
             for acquisition_id in acquisition_ids_filtered:
                 images = ome_zarr_plate.well_images_paths(
-                    row=row, column=column, acquisition=acquisition_id
+                    row=row, column=int(column), acquisition=acquisition_id
                 )
                 if len(images) == 0:
                     raise ValueError(
@@ -219,18 +220,37 @@ def stitch_and_register_init(
                     )
                 else:
                     acquisition_paths.append(images[0])
+            wells.append((row, column, acquisition_paths))
 
-            # TODO: think about changing new path simply to str(new_acquisition_id)
-            zarr_url_new = (
-                plate_root
-                / ome_zarr_plate.add_image(
+        # Create a new plate holding one fused image per well; the input plate
+        # is never modified, so a failed run leaves it fully intact.
+        new_plate_root = Path(zarr_dir) / f"{plate_root.stem}_{new_plate_suffix}.zarr"
+        if any(new_plate_root.resolve() == p.resolve() for p in plate_roots):
+            raise ValueError(
+                f"Output plate path {new_plate_root} collides with an input plate. "
+                "Choose a different `new_plate_suffix`."
+            )
+        logging.info(f"Writing fused output to new plate at {new_plate_root}.")
+        new_plate = create_empty_plate(
+            store=new_plate_root,
+            name=new_plate_root.stem,
+            images=[
+                ImageInWellPath(
                     row=row,
                     column=column,
-                    image_path="fused",
-                    acquisition_id=new_acquisition_id,
+                    path="0",
+                    acquisition_id=0,
+                    acquisition_name="fused",
                 )
-            ).as_posix()
+                for row, column, _ in wells
+            ],
+            overwrite=True,
+        )
 
+        for row, column, acquisition_paths in wells:
+            zarr_url_new = (
+                new_plate_root / new_plate.well_images_paths(row=row, column=column)[0]
+            ).as_posix()
             init_args = {
                 "zarr_urls_to_register": [
                     (plate_root / p).as_posix() for p in acquisition_paths
@@ -243,7 +263,6 @@ def stitch_and_register_init(
                 "pyramid_level": pyramid_level,
                 "z_project": z_project,
                 "pre_registration": pre_registration,
-                "keep_original_acquisitions": keep_original_acquisitions,
                 "tile_correction": tile_correction.model_dump(),
                 "fusion_region": fusion_region,
                 "interpolation_order": interpolation_order,
@@ -254,14 +273,6 @@ def stitch_and_register_init(
                     "init_args": init_args,
                 }
             )
-            if not keep_original_acquisitions:
-                # remove individual acquisitions from plate metadata
-                for acquisition_path in acquisition_paths:
-                    ome_zarr_plate.remove_image(
-                        row=row,
-                        column=column,
-                        image_path=str(acquisition_path.split("/")[-1]),
-                    )
 
     logging.info("Returning parallelization list for combine_acquisitions_parallel.")
     return {"parallelization_list": parallelization_list}

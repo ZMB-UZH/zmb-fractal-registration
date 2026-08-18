@@ -161,6 +161,19 @@ def _create_test_plate(plate_path: Path) -> list[str]:
     return _build_plate(plate_path, [_std_rois(), _std_rois()])
 
 
+def _open_fused_image(plate_path: Path):
+    """The single fused image in the `_fused` plate derived from plate_path.
+
+    The task writes its output to a new plate next to the original (inside
+    zarr_dir, which the tests pass as the original's parent directory).
+    """
+    fused_plate_path = plate_path.parent / f"{plate_path.stem}_fused.zarr"
+    fused_plate = open_ome_zarr_plate(fused_plate_path)
+    fused_images = list(fused_plate.get_images(acquisition=0).values())
+    assert len(fused_images) == 1
+    return fused_images[0].get_image()
+
+
 def test_stitch_and_register(tmp_path: Path):
     """Smoke test for the stitch and register task."""
     plate_path = tmp_path / "test.zarr"
@@ -184,16 +197,16 @@ def test_stitch_and_register(tmp_path: Path):
             init_args=item["init_args"],
         )
 
-    # Check that the fused acquisition was created
-    plate = open_ome_zarr_plate(plate_path)
-    fused_acq_id = max(plate.acquisition_ids)
-    fused_images = list(plate.get_images(acquisition=fused_acq_id).values())
-    assert len(fused_images) == 1
-
-    # Check that channels from both cycles are present (1 channel x 2 cycles = 2)
-    fused_image = fused_images[0].get_image()
+    # Check that the fused plate was created, with channels from both cycles
+    # (1 channel x 2 cycles = 2).
+    fused_image = _open_fused_image(plate_path)
     assert len(fused_image.channel_labels) == 2
     assert any("DAPI" in label for label in fused_image.channel_labels)
+
+    # The original plate is left untouched.
+    plate = open_ome_zarr_plate(plate_path)
+    assert set(plate.acquisition_ids) == {0, 1}
+    assert len(plate.images_paths()) == 2
 
 
 def _create_plate_with_far_tiles(
@@ -632,22 +645,14 @@ def test_non_overlapping_tile(tmp_path: Path):
     zarr_urls = _create_plate_with_far_tiles(plate_path, all_nonref_tiles_far=False)
     _run_stitch_and_register(zarr_urls, str(tmp_path))
 
-    plate = open_ome_zarr_plate(plate_path)
-    fused_acq_id = max(plate.acquisition_ids)
-    fused_images = list(plate.get_images(acquisition=fused_acq_id).values())
-    assert len(fused_images) == 1
-    fused_image = fused_images[0].get_image()
+    fused_image = _open_fused_image(plate_path)
     assert len(fused_image.channel_labels) == 2
     assert any("DAPI" in label for label in fused_image.channel_labels)
 
 
 def _fused_shape(plate_path: Path) -> tuple[int, ...]:
-    """Return the shape of the single fused image in a processed plate."""
-    plate = open_ome_zarr_plate(plate_path)
-    fused_acq_id = max(plate.acquisition_ids)
-    fused_image = next(
-        iter(plate.get_images(acquisition=fused_acq_id).values())
-    ).get_image()
+    """Return the shape of the single fused image for a processed plate."""
+    fused_image = _open_fused_image(plate_path)
     assert len(fused_image.channel_labels) == 2
     return fused_image.shape
 
@@ -927,11 +932,7 @@ def test_pre_registration_task(tmp_path: Path):
     zarr_urls = _create_offset_plate(plate_path, offset_um=16 * _PIXEL_SIZE)
     _run_stitch_and_register(zarr_urls, str(tmp_path), pre_registration=True)
 
-    plate = open_ome_zarr_plate(plate_path)
-    fused_acq_id = max(plate.acquisition_ids)
-    fused_images = list(plate.get_images(acquisition=fused_acq_id).values())
-    assert len(fused_images) == 1
-    fused_image = fused_images[0].get_image()
+    fused_image = _open_fused_image(plate_path)
     assert len(fused_image.channel_labels) == 2
 
 
@@ -1002,10 +1003,7 @@ def test_stitch_and_register_with_wavelength_id_channel(tmp_path: Path):
             zarr_url=item["zarr_url"], init_args=item["init_args"]
         )
 
-    plate = open_ome_zarr_plate(plate_path)
-    fused = next(
-        iter(plate.get_images(acquisition=max(plate.acquisition_ids)).values())
-    ).get_image()
+    fused = _open_fused_image(plate_path)
     # 2 channels x 2 cycles
     assert len(fused.channel_labels) == 4
 
@@ -1059,10 +1057,6 @@ def test_all_tiles_non_overlapping_fallback(tmp_path: Path):
     zarr_urls = _create_plate_with_far_tiles(plate_path, all_nonref_tiles_far=True)
     _run_stitch_and_register(zarr_urls, str(tmp_path))
 
-    plate = open_ome_zarr_plate(plate_path)
-    fused_acq_id = max(plate.acquisition_ids)
-    fused_images = list(plate.get_images(acquisition=fused_acq_id).values())
-    assert len(fused_images) == 1
-    fused_image = fused_images[0].get_image()
+    fused_image = _open_fused_image(plate_path)
     assert len(fused_image.channel_labels) == 2
     assert any("DAPI" in label for label in fused_image.channel_labels)

@@ -25,11 +25,10 @@ def stitch_and_register(
         mode="index", identifier="0"
     ),
     cycle_names: Optional[list[str]] = None,
-    z_project: bool = True,
     pyramid_level: int = 0,
-    pre_registration: bool = False,
+    z_project: bool = True,
+    pre_registration: bool = True,
     tile_correction: TileCorrectionModel = TileCorrectionModel(),
-    keep_original_acquisitions: bool = True,
     fusion_region: Literal["union", "intersection", "intersection_bbox"] = "union",
     interpolation_order: int = 0,
     show_logs: bool = False,
@@ -53,21 +52,15 @@ def stitch_and_register(
         cycle_names: Optional names for each acquisition. Used to disambiguate
             channels in the output (e.g. `DAPI_cycle0`). If None, defaults to
             `cycle0`, `cycle1`, etc.
+        pyramid_level: Pyramid level used for stitching/registration.
         z_project: If True, compute stitching/registration on a maximum-
             intensity Z-projection and apply the transforms to the full 3D
             volume. If False, operate on the full volume directly.
-        pyramid_level: Pyramid level used for stitching/registration.
         pre_registration: If True, perform a rough pre-registration of the
-            acquisitions before the accurate stitching and registration. Each
-            acquisition is fused from its original stage coordinates at the
-            coarsest pyramid level, and the fused acquisitions are registered
-            against the reference acquisition as a whole. Use this when the
-            shifts between acquisitions are large compared to the tile overlap
-            and are therefore not recoverable from the stage coordinates alone.
+            acquisitions before the accurate stitching and registration. Use
+            this if there are significant global shifts between acquisitions.
         tile_correction: Settings for correcting non-overlapping tiles and
             filtering outliers. See `TileCorrectionModel` for details.
-        keep_original_acquisitions: If True, keep the original acquisitions.
-            If False, delete them after processing.
         fusion_region: Which region of the registered cycles to save.
             'union': save the full extent covered by any cycle.
             'intersection': tight box of the region covered by every cycle;
@@ -105,7 +98,6 @@ def stitch_and_register(
         pyramid_level=pyramid_level,
         z_project=z_project,
         pre_registration=pre_registration,
-        keep_original_acquisitions=keep_original_acquisitions,
         tile_correction=tile_correction,
         fusion_region=fusion_region,
         interpolation_order=interpolation_order,

@@ -27,7 +27,6 @@
 #   resampling path - worth checking upstream first.
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Any, Literal
 
@@ -81,10 +80,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
         pre_registration: If True, roughly align whole cycles against the
             reference cycle before the accurate stitching/registration. Each
             cycle is fused from its stage coordinates at the coarsest pyramid
-            level and registered as a whole, assuming all cycles cover roughly
-            the same area.
-        keep_original_acquisitions: If True, keep the original acquisitions.
-            If False, remove them after processing.
+            level and registered as a whole.
         tile_correction: Settings for correcting non-overlapping tiles and
             filtering outliers.
         fusion_region: Which region of the registered cycles to save.
@@ -104,8 +100,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
     reference_channel: ChannelSelectionModel
     pyramid_level: int = 0
     z_project: bool = True
-    pre_registration: bool = False
-    keep_original_acquisitions: bool = True
+    pre_registration: bool = True
     tile_correction: TileCorrectionModel = TileCorrectionModel()
     fusion_region: Literal["union", "intersection", "intersection_bbox"] = "union"
     interpolation_order: int = 0
@@ -499,21 +494,8 @@ def stitch_and_register_parallel(
         }
     ]
 
-    if init_args.keep_original_acquisitions:
-        logger.info("Keeping original acquisitions. Task complete.")
-        return {"image_list_updates": image_list_updates}
-
-    logger.info(
-        f"Removing {len(init_args.zarr_urls_to_register)} original acquisition(s)..."
-    )
-    for url in init_args.zarr_urls_to_register:
-        logger.info(f"Deleting original acquisition at '{url}'.")
-        shutil.rmtree(url)
     logger.info("Task complete.")
-    return {
-        "image_list_updates": image_list_updates,
-        "image_list_removals": init_args.zarr_urls_to_register,
-    }
+    return {"image_list_updates": image_list_updates}
 
 
 if __name__ == "__main__":

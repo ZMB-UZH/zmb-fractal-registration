@@ -22,7 +22,7 @@ Key features:
 
 ### Outputs
 
-Creates a new OME-Zarr acquisition named **`fused`** within the same plate. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.
+Creates a **new OME-Zarr plate**, named after the original with `new_plate_suffix` appended (default: `plate.zarr` → `plate_fused.zarr`), holding one fused image per well under a single acquisition named `fused`. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.
 
 After registration the cycles rarely cover exactly the same area, so `fusion_region` selects which part of that area is written:
 
@@ -31,8 +31,6 @@ After registration the cycles rarely cover exactly the same area, so `fusion_reg
 - **`intersection_bbox`** - the largest rectangular box that is *entirely* covered by every cycle. No pixels are set to `0`, at the cost of discarding parts of the common region that do not fit into a single box.
 
 `intersection` and `intersection_bbox` differ only when the covered region is not itself rectangular (e.g. a missing or badly shifted tile punches a hole in it). If the cycles share no common region at all, both raise an error.
-
-If `keep_original_acquisitions` is `False`, the individual input acquisitions are removed from the plate after fusion.
 
 ### Limitations
 
