@@ -934,6 +934,10 @@ def test_pre_registration_task(tmp_path: Path):
 
     fused_image = _open_fused_image(plate_path)
     assert len(fused_image.channel_labels) == 2
+    # The recovered offset puts both cycles on top of each other, so the canvas
+    # is a single cycle's extent (plus a few px of registration residue). A
+    # coordinate mismatch between the fused cycles used to double it silently.
+    assert abs(fused_image.shape[-1] - (2 * _PREREG_FOV_PX - _PREREG_OVERLAP_PX)) <= 16
 
 
 # Labels and wavelength IDs are deliberately disjoint: a wavelength ID must not
@@ -1060,3 +1064,7 @@ def test_all_tiles_non_overlapping_fallback(tmp_path: Path):
     fused_image = _open_fused_image(plate_path)
     assert len(fused_image.channel_labels) == 2
     assert any("DAPI" in label for label in fused_image.channel_labels)
+    # Union of the reference ([0, 2 fov]) and the far tiles ([10 fov, 12 fov]),
+    # so 12 FOV widths. A coordinate mismatch between the fused cycles used to
+    # double the canvas silently.
+    assert abs(fused_image.shape[-1] - 12 * _FOV_PX) <= 8

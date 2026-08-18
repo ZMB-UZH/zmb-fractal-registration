@@ -279,6 +279,7 @@ def _fuse_cycles(
 
     sims_fused = {}
     masks_fused = {}
+    canvas_coords = None
     for cycle in cycles:
         logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
         cycle_sims = [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
@@ -305,8 +306,27 @@ def _fuse_cycles(
                 output_origin=global_origin,
                 output_shape=global_shape,
             )
+        # All cycles share one output canvas, but multiview-stitcher recomputes
+        # the coordinates per cycle with float rounding that can differ in the
+        # last bits (~1e-12). xarray alignment treats such coordinates as
+        # different positions: the concat below would then pad every cycle with
+        # NaN over the other cycles' extent, and the NaN reaches the integer
+        # output as garbage values. Snap all cycles onto identical coordinates.
+        if canvas_coords is None:
+            canvas_coords = {
+                dim: sims_fused[cycle].coords[dim].values for dim in global_shape
+            }
+        else:
+            sims_fused[cycle] = sims_fused[cycle].assign_coords(canvas_coords)
+            if cycle in masks_fused:
+                masks_fused[cycle] = masks_fused[cycle].assign_coords(canvas_coords)
 
-    sim_fused_all = xr.concat([sims_fused[cycle] for cycle in cycles], dim="c")
+    # join="exact": the cycles are on identical coordinates by construction
+    # above; anything else is a bug that must fail loudly instead of silently
+    # growing the canvas.
+    sim_fused_all = xr.concat(
+        [sims_fused[cycle] for cycle in cycles], dim="c", join="exact"
+    )
 
     if fusion_region == "intersection":
         # Keep only pixels covered by every cycle; zero the rest (preserves dtype).
