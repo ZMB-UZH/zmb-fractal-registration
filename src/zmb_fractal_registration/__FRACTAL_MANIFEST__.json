@@ -32,6 +32,7 @@
       "args_schema_non_parallel": {
         "$defs": {
           "AcquisitionInputModel": {
+            "additionalProperties": false,
             "description": "Input model for acquisitions.",
             "properties": {
               "acquisition_ID": {
@@ -52,6 +53,7 @@
             "type": "object"
           },
           "AcquisitionsSelectionModel": {
+            "additionalProperties": false,
             "description": "Model to select which acquisitions to process.",
             "properties": {
               "use_all_acquisitions": {
@@ -100,6 +102,7 @@
             "type": "object"
           },
           "TileCorrectionModel": {
+            "additionalProperties": false,
             "description": "Settings for correcting non-overlapping tiles and filtering outliers.",
             "properties": {
               "correction_method": {
@@ -342,6 +345,7 @@
             "type": "object"
           },
           "TileCorrectionModel": {
+            "additionalProperties": false,
             "description": "Settings for correcting non-overlapping tiles and filtering outliers.",
             "properties": {
               "correction_method": {

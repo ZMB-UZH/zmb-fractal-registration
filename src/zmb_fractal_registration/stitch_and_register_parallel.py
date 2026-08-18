@@ -493,7 +493,7 @@ def stitch_and_register_parallel(
             "zarr_url": zarr_url,
             "origin": init_args.zarr_urls_to_register[0],
             "attributes": {
-                "acquisition": Path(zarr_url).as_posix().split("/")[-1],
+                "acquisition": Path(zarr_url).name,
             },
             # TODO: better passing of acquisition metadata (maybe pass from init task)
         }

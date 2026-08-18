@@ -61,63 +61,104 @@ _FOV_PX = 64  # pixels per FOV side
 _OVERLAP_PX = 32  # 50% overlap -> enough for multiview_stitcher adjacency detection
 
 
-def _create_test_plate(plate_path: Path) -> list[str]:
-    """Create a minimal test plate with 2 acquisitions, each with 2 overlapping FOVs.
+def _std_rois(
+    fov_px: int = _FOV_PX, overlap_px: int = _OVERLAP_PX, x_offset_um: float = 0.0
+) -> list[Roi]:
+    """Two side-by-side FOVs with 50% overlap in x.
 
-    Each acquisition has one image containing 2 side-by-side tiles with 50% overlap.
-    The FOV_ROI_table describes the world-space position of each tile.
+    FOV 1: world x=[0, fov_size_um] -> pixels x=[0:fov_px].
+    FOV 2: world x=[fov_size_um-overlap_um, 2*fov_size_um-overlap_um]
+      -> pixels x=[overlap_px:2*fov_px-overlap_px].
+    `x_offset_um` shifts only the `*_micrometer_original` stage coordinates
+    (the positions the task initializes the tiles from), not the pixel slices.
     """
-    img_shape = (1, _FOV_PX, 2 * _FOV_PX - _OVERLAP_PX)
-    fov_size_um = _FOV_PX * _PIXEL_SIZE
-    overlap_um = _OVERLAP_PX * _PIXEL_SIZE
+    fov_size_um = fov_px * _PIXEL_SIZE
+    overlap_um = overlap_px * _PIXEL_SIZE
+    return [
+        Roi.from_values(
+            slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
+            name="FOV_1",
+            y_micrometer_original=0.0,
+            x_micrometer_original=x_offset_um,
+        ),
+        Roi.from_values(
+            slices={
+                "y": (0.0, fov_size_um),
+                "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
+            },
+            name="FOV_2",
+            y_micrometer_original=0.0,
+            x_micrometer_original=fov_size_um - overlap_um + x_offset_um,
+        ),
+    ]
 
+
+def _displaced_roi(name: str, x_um: float, fov_px: int = _FOV_PX) -> Roi:
+    """A tile reusing FOV_1's pixel region, but placed at `x_um` in world space.
+
+    The slice coordinates reuse the first FOV's pixel region so that
+    image.get_roi() succeeds; only the world-space stage coordinate is moved.
+    """
+    fov_size_um = fov_px * _PIXEL_SIZE
+    return Roi.from_values(
+        slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
+        name=name,
+        y_micrometer_original=0.0,
+        x_micrometer_original=x_um,
+    )
+
+
+def _build_plate(
+    plate_path: Path,
+    rois_per_acquisition: list[list[Roi]],
+    channels_per_acquisition: list[list] | None = None,
+    fov_px: int = _FOV_PX,
+    overlap_px: int = _OVERLAP_PX,
+    levels: int | None = None,
+) -> list[str]:
+    """Create a plate with one image per acquisition and the given ROI tables.
+
+    Each image is two FOVs wide (fov_px high, 2*fov_px-overlap_px wide) and
+    lives in well A/1 under paths "0", "1", ... with matching acquisition IDs.
+    Returns the zarr URL of each image.
+    """
+    n_acq = len(rois_per_acquisition)
+    if channels_per_acquisition is None:
+        channels_per_acquisition = [["DAPI"] for _ in range(n_acq)]
     plate = create_empty_plate(
         store=plate_path,
         name="test_plate",
         images=[
-            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
-            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
+            ImageInWellPath(row="A", column=1, path=str(i), acquisition_id=i)
+            for i in range(n_acq)
         ],
         overwrite=True,
     )
-
     zarr_urls = []
-    for img_rel_path in plate.images_paths():
+    for img_rel_path, rois, channels in zip(
+        plate.images_paths(),
+        rois_per_acquisition,
+        channels_per_acquisition,
+        strict=True,
+    ):
         img_path = plate_path / img_rel_path
+        levels_kwargs = {} if levels is None else {"levels": levels}
         container = create_synthetic_ome_zarr(
             store=img_path,
-            shape=img_shape,
+            shape=(len(channels), fov_px, 2 * fov_px - overlap_px),
             axes_names="cyx",
-            channels_meta=["DAPI"],
+            channels_meta=channels,
             overwrite=True,
+            **levels_kwargs,
         )
-
-        # Two FOVs side-by-side with 50% overlap in x.
-        # FOV 1: world x=[0, fov_size_um]
-        #   -> pixels x=[0:FOV_PX]
-        # FOV 2: world x=[fov_size_um-overlap_um, 2*fov_size_um-overlap_um]
-        #   -> pixels x=[OVERLAP_PX:2*FOV_PX-OVERLAP_PX]
-        rois = [
-            Roi.from_values(
-                slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                name="FOV_1",
-                y_micrometer_original=0.0,
-                x_micrometer_original=0.0,
-            ),
-            Roi.from_values(
-                slices={
-                    "y": (0.0, fov_size_um),
-                    "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
-                },
-                name="FOV_2",
-                y_micrometer_original=0.0,
-                x_micrometer_original=fov_size_um - overlap_um,
-            ),
-        ]
         container.add_table("FOV_ROI_table", RoiTable(rois=rois))
         zarr_urls.append(str(img_path))
-
     return zarr_urls
+
+
+def _create_test_plate(plate_path: Path) -> list[str]:
+    """A minimal plate: 2 acquisitions, each with 2 overlapping FOVs."""
+    return _build_plate(plate_path, [_std_rois(), _std_rois()])
 
 
 def test_stitch_and_register(tmp_path: Path):
@@ -159,97 +200,25 @@ def _create_plate_with_far_tiles(
     plate_path: Path,
     all_nonref_tiles_far: bool = False,
 ) -> list[str]:
-    """Create a test plate where the non-reference cycle contains tiles placed far
-    from the reference tiles (no spatial overlap).
+    """A plate whose non-reference cycle has tiles far from the reference tiles.
 
     When ``all_nonref_tiles_far`` is False (default), the non-ref cycle has two
     normal overlapping tiles plus one extra tile positioned far in world space
-    (reusing the same pixel data as FOV_1 so pixel extraction remains valid).
+    (no spatial overlap with the reference).
 
     When ``all_nonref_tiles_far`` is True, *all* non-ref tiles are placed far away,
     exercising the fallback path where no inlier tiles exist.
     """
-    img_shape = (1, _FOV_PX, 2 * _FOV_PX - _OVERLAP_PX)
     fov_size_um = _FOV_PX * _PIXEL_SIZE
-    overlap_um = _OVERLAP_PX * _PIXEL_SIZE
-
-    plate = create_empty_plate(
-        store=plate_path,
-        name="test_plate",
-        images=[
-            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
-            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
-        ],
-        overwrite=True,
-    )
-
-    zarr_urls = []
-    for idx, img_rel_path in enumerate(plate.images_paths()):
-        img_path = plate_path / img_rel_path
-        container = create_synthetic_ome_zarr(
-            store=img_path,
-            shape=img_shape,
-            axes_names="cyx",
-            channels_meta=["DAPI"],
-            overwrite=True,
-        )
-
-        if idx == 0 or not all_nonref_tiles_far:
-            # Standard two overlapping FOVs (also used for ref cycle, idx==0).
-            rois = [
-                Roi.from_values(
-                    slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                    name="FOV_1",
-                    y_micrometer_original=0.0,
-                    x_micrometer_original=0.0,
-                ),
-                Roi.from_values(
-                    slices={
-                        "y": (0.0, fov_size_um),
-                        "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
-                    },
-                    name="FOV_2",
-                    y_micrometer_original=0.0,
-                    x_micrometer_original=fov_size_um - overlap_um,
-                ),
-            ]
-        else:
-            rois = []
-
-        if idx == 1:
-            # Place one or two tiles far outside the reference region.
-            # The slice coordinates reuse the FOV_1 pixel region so that
-            # image.get_roi() succeeds; only the world-space origin is far.
-            far_x = 10.0 * fov_size_um
-            if all_nonref_tiles_far:
-                rois = [
-                    Roi.from_values(
-                        slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                        name="FOV_1_far",
-                        y_micrometer_original=0.0,
-                        x_micrometer_original=far_x,
-                    ),
-                    Roi.from_values(
-                        slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                        name="FOV_2_far",
-                        y_micrometer_original=0.0,
-                        x_micrometer_original=far_x + fov_size_um,
-                    ),
-                ]
-            else:
-                rois.append(
-                    Roi.from_values(
-                        slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                        name="FOV_3_far",
-                        y_micrometer_original=0.0,
-                        x_micrometer_original=far_x,
-                    )
-                )
-
-        container.add_table("FOV_ROI_table", RoiTable(rois=rois))
-        zarr_urls.append(str(img_path))
-
-    return zarr_urls
+    far_x = 10.0 * fov_size_um
+    if all_nonref_tiles_far:
+        nonref_rois = [
+            _displaced_roi("FOV_1_far", far_x),
+            _displaced_roi("FOV_2_far", far_x + fov_size_um),
+        ]
+    else:
+        nonref_rois = [*_std_rois(), _displaced_roi("FOV_3_far", far_x)]
+    return _build_plate(plate_path, [_std_rois(), nonref_rois])
 
 
 def _run_stitch_and_register(
@@ -683,52 +652,25 @@ def _fused_shape(plate_path: Path) -> tuple[int, ...]:
     return fused_image.shape
 
 
-def test_fusion_region_intersection(tmp_path: Path):
-    """Intersection fusion completes and is no larger than the union output.
+def test_fusion_regions(tmp_path: Path):
+    """The three fusion regions produce consistently sized outputs.
 
-    The two non-ref tiles placed far away mean the non-ref cycle covers a much
-    wider extent than the reference, so the intersection canvas must be strictly
-    smaller than the union canvas along x.
+    The far-away non-ref tile means the non-ref cycle covers a much wider
+    extent than the reference, so both intersection canvases must be strictly
+    smaller than the union canvas along x. For a rectangular tile layout the
+    per-pixel intersection already fills its bounding box, so 'intersection'
+    and 'intersection_bbox' share the same shape.
     """
-    union_path = tmp_path / "union.zarr"
-    union_urls = _create_plate_with_far_tiles(union_path, all_nonref_tiles_far=False)
-    _run_stitch_and_register(union_urls, str(tmp_path), fusion_region="union")
+    shapes = {}
+    for region in ("union", "intersection", "intersection_bbox"):
+        plate_path = tmp_path / f"{region}.zarr"
+        zarr_urls = _create_plate_with_far_tiles(plate_path)
+        _run_stitch_and_register(zarr_urls, str(tmp_path), fusion_region=region)
+        shapes[region] = _fused_shape(plate_path)
 
-    inter_path = tmp_path / "intersection.zarr"
-    inter_urls = _create_plate_with_far_tiles(inter_path, all_nonref_tiles_far=False)
-    _run_stitch_and_register(inter_urls, str(tmp_path), fusion_region="intersection")
-
-    union_shape = _fused_shape(union_path)
-    inter_shape = _fused_shape(inter_path)
     # Intersection drops the far tile's exclusive region -> smaller along x.
-    assert inter_shape[-1] < union_shape[-1]
-
-
-def test_fusion_region_intersection_bbox(tmp_path: Path):
-    """intersection_bbox is smaller than union and matches the intersection box.
-
-    For a rectangular tile layout the per-pixel intersection already fills its
-    bounding box, so 'intersection' and 'intersection_bbox' share the same shape.
-    """
-    union_path = tmp_path / "union.zarr"
-    union_urls = _create_plate_with_far_tiles(union_path, all_nonref_tiles_far=False)
-    _run_stitch_and_register(union_urls, str(tmp_path), fusion_region="union")
-
-    inter_path = tmp_path / "intersection.zarr"
-    inter_urls = _create_plate_with_far_tiles(inter_path, all_nonref_tiles_far=False)
-    _run_stitch_and_register(inter_urls, str(tmp_path), fusion_region="intersection")
-
-    bbox_path = tmp_path / "intersection_bbox.zarr"
-    bbox_urls = _create_plate_with_far_tiles(bbox_path, all_nonref_tiles_far=False)
-    _run_stitch_and_register(
-        bbox_urls, str(tmp_path), fusion_region="intersection_bbox"
-    )
-
-    union_shape = _fused_shape(union_path)
-    inter_shape = _fused_shape(inter_path)
-    bbox_shape = _fused_shape(bbox_path)
-    assert bbox_shape[-1] < union_shape[-1]
-    assert bbox_shape == inter_shape
+    assert shapes["intersection"][-1] < shapes["union"][-1]
+    assert shapes["intersection_bbox"] == shapes["intersection"]
 
 
 # ---------------------------------------------------------------------------
@@ -757,63 +699,18 @@ def _create_offset_plate(
     whose stage coordinate places it that far along x, which drags the origin
     of that cycle's bounding box away from its actual content.
     """
-    img_shape = (1, _PREREG_FOV_PX, 2 * _PREREG_FOV_PX - _PREREG_OVERLAP_PX)
-    fov_size_um = _PREREG_FOV_PX * _PIXEL_SIZE
-    overlap_um = _PREREG_OVERLAP_PX * _PIXEL_SIZE
-
-    plate = create_empty_plate(
-        store=plate_path,
-        name="test_plate",
-        images=[
-            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
-            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
-        ],
-        overwrite=True,
-    )
-
-    zarr_urls = []
-    for idx, img_rel_path in enumerate(plate.images_paths()):
-        img_path = plate_path / img_rel_path
-        container = create_synthetic_ome_zarr(
-            store=img_path,
-            shape=img_shape,
-            axes_names="cyx",
-            channels_meta=["DAPI"],
-            levels=_PREREG_LEVELS,
-            overwrite=True,
+    nonref_rois = _std_rois(_PREREG_FOV_PX, _PREREG_OVERLAP_PX, x_offset_um=offset_um)
+    if stray_tile_um is not None:
+        nonref_rois.append(
+            _displaced_roi("FOV_stray", stray_tile_um, fov_px=_PREREG_FOV_PX)
         )
-        offset = offset_um if idx == 1 else 0.0
-        rois = [
-            Roi.from_values(
-                slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                name="FOV_1",
-                y_micrometer_original=0.0,
-                x_micrometer_original=offset,
-            ),
-            Roi.from_values(
-                slices={
-                    "y": (0.0, fov_size_um),
-                    "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
-                },
-                name="FOV_2",
-                y_micrometer_original=0.0,
-                x_micrometer_original=fov_size_um - overlap_um + offset,
-            ),
-        ]
-        if idx == 1 and stray_tile_um is not None:
-            # Reuses FOV_1's pixel region; only its world position is far away.
-            rois.append(
-                Roi.from_values(
-                    slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                    name="FOV_stray",
-                    y_micrometer_original=0.0,
-                    x_micrometer_original=stray_tile_um,
-                )
-            )
-        container.add_table("FOV_ROI_table", RoiTable(rois=rois))
-        zarr_urls.append(str(img_path))
-
-    return zarr_urls
+    return _build_plate(
+        plate_path,
+        [_std_rois(_PREREG_FOV_PX, _PREREG_OVERLAP_PX), nonref_rois],
+        fov_px=_PREREG_FOV_PX,
+        overlap_px=_PREREG_OVERLAP_PX,
+        levels=_PREREG_LEVELS,
+    )
 
 
 def _translations(msims: list, transform_key: str) -> list[np.ndarray]:
@@ -1048,54 +945,18 @@ _WAVELENGTH_CHANNELS = [
 
 def _create_plate_with_wavelength_ids(plate_path: Path) -> list[str]:
     """A plate whose channels carry wavelength IDs distinct from their labels."""
-    img_shape = (len(_WAVELENGTH_CHANNELS), _FOV_PX, 2 * _FOV_PX - _OVERLAP_PX)
-    fov_size_um = _FOV_PX * _PIXEL_SIZE
-    overlap_um = _OVERLAP_PX * _PIXEL_SIZE
-
-    plate = create_empty_plate(
-        store=plate_path,
-        name="test_plate",
-        images=[
-            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
-            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
-        ],
-        overwrite=True,
-    )
-
-    zarr_urls = []
-    for img_rel_path in plate.images_paths():
-        img_path = plate_path / img_rel_path
-        container = create_synthetic_ome_zarr(
-            store=img_path,
-            shape=img_shape,
-            axes_names="cyx",
-            channels_meta=[
-                Channel.default_init(label=label, wavelength_id=wavelength_id)
-                for label, wavelength_id in _WAVELENGTH_CHANNELS
-            ],
-            overwrite=True,
-        )
-        rois = [
-            Roi.from_values(
-                slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                name="FOV_1",
-                y_micrometer_original=0.0,
-                x_micrometer_original=0.0,
-            ),
-            Roi.from_values(
-                slices={
-                    "y": (0.0, fov_size_um),
-                    "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
-                },
-                name="FOV_2",
-                y_micrometer_original=0.0,
-                x_micrometer_original=fov_size_um - overlap_um,
-            ),
+    channels_per_acquisition = [
+        [
+            Channel.default_init(label=label, wavelength_id=wavelength_id)
+            for label, wavelength_id in _WAVELENGTH_CHANNELS
         ]
-        container.add_table("FOV_ROI_table", RoiTable(rois=rois))
-        zarr_urls.append(str(img_path))
-
-    return zarr_urls
+        for _ in range(2)
+    ]
+    return _build_plate(
+        plate_path,
+        [_std_rois(), _std_rois()],
+        channels_per_acquisition=channels_per_acquisition,
+    )
 
 
 def test_resolve_registration_channel_by_wavelength_id(tmp_path: Path):
@@ -1150,57 +1011,16 @@ def test_stitch_and_register_with_wavelength_id_channel(tmp_path: Path):
 
 
 def _create_plate_with_mismatched_channels(plate_path: Path) -> list[str]:
-    """Create a plate where the second acquisition is missing a channel.
+    """A plate where the second acquisition is missing a channel.
 
     Acquisition 0 has ["DAPI", "GFP"], acquisition 1 only has ["DAPI"], mimicking
     an imaging round that was acquired with fewer channels than the reference.
     """
-    img_shape = (1, _FOV_PX, 2 * _FOV_PX - _OVERLAP_PX)
-    fov_size_um = _FOV_PX * _PIXEL_SIZE
-    overlap_um = _OVERLAP_PX * _PIXEL_SIZE
-
-    plate = create_empty_plate(
-        store=plate_path,
-        name="test_plate",
-        images=[
-            ImageInWellPath(row="A", column=1, path="0", acquisition_id=0),
-            ImageInWellPath(row="A", column=1, path="1", acquisition_id=1),
-        ],
-        overwrite=True,
+    return _build_plate(
+        plate_path,
+        [_std_rois(), _std_rois()],
+        channels_per_acquisition=[["DAPI", "GFP"], ["DAPI"]],
     )
-
-    zarr_urls = []
-    for idx, img_rel_path in enumerate(plate.images_paths()):
-        img_path = plate_path / img_rel_path
-        channels = ["DAPI", "GFP"] if idx == 0 else ["DAPI"]
-        container = create_synthetic_ome_zarr(
-            store=img_path,
-            shape=(len(channels), *img_shape[1:]),
-            axes_names="cyx",
-            channels_meta=channels,
-            overwrite=True,
-        )
-        rois = [
-            Roi.from_values(
-                slices={"y": (0.0, fov_size_um), "x": (0.0, fov_size_um)},
-                name="FOV_1",
-                y_micrometer_original=0.0,
-                x_micrometer_original=0.0,
-            ),
-            Roi.from_values(
-                slices={
-                    "y": (0.0, fov_size_um),
-                    "x": (fov_size_um - overlap_um, 2 * fov_size_um - overlap_um),
-                },
-                name="FOV_2",
-                y_micrometer_original=0.0,
-                x_micrometer_original=fov_size_um - overlap_um,
-            ),
-        ]
-        container.add_table("FOV_ROI_table", RoiTable(rois=rois))
-        zarr_urls.append(str(img_path))
-
-    return zarr_urls
 
 
 def test_registration_channel_missing_in_other_acquisition(tmp_path: Path):

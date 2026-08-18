@@ -5,11 +5,13 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from ngio import ChannelSelectionModel, open_ome_zarr_plate
-from pydantic import BaseModel, model_validator, validate_call
+from pydantic import BaseModel, ConfigDict, model_validator, validate_call
 
 
 class TileCorrectionModel(BaseModel):
     """Settings for correcting non-overlapping tiles and filtering outliers."""
+
+    model_config = ConfigDict(extra="forbid")
 
     correction_method: Literal["reregister", "mean_shift"] = "reregister"
     """How to correct leftover tiles (outliers and non-overlapping tiles).
@@ -35,15 +37,24 @@ class TileCorrectionModel(BaseModel):
 class AcquisitionInputModel(BaseModel):
     """Input model for acquisitions."""
 
+    model_config = ConfigDict(extra="forbid")
+
     acquisition_ID: int
     """Acquisition ID in plate."""
     optional_cycle_name: Optional[str] = None
     """Optional cycle name. Will be appended to original channel labels.
         If None, defaults to `cycle{acquisition_ID}`."""
 
+    @property
+    def cycle_name(self) -> str:
+        """The cycle name, defaulting to `cycle{acquisition_ID}`."""
+        return self.optional_cycle_name or f"cycle{self.acquisition_ID}"
+
 
 class AcquisitionsSelectionModel(BaseModel):
     """Model to select which acquisitions to process."""
+
+    model_config = ConfigDict(extra="forbid")
 
     use_all_acquisitions: bool = True
     """If True, all acquisitions in the plate are used and `acquisitions` must
@@ -150,10 +161,7 @@ def stitch_and_register_init(
             for acq in acquisitions_to_include.acquisitions:
                 if acq.acquisition_ID in acquisition_ids:
                     acquisition_ids_filtered.append(acq.acquisition_ID)
-                    if acq.optional_cycle_name:
-                        cycle_names.append(acq.optional_cycle_name)
-                    else:
-                        cycle_names.append(f"cycle{acq.acquisition_ID}")
+                    cycle_names.append(acq.cycle_name)
                 else:
                     logging.warning(
                         f"Acquisition ID {acq.acquisition_ID} not found in plate at "
@@ -180,10 +188,7 @@ def stitch_and_register_init(
                 "the list of acquisitions to process."
             )
             acquisition_ids_filtered.append(reference_acquisition.acquisition_ID)
-            if reference_acquisition.optional_cycle_name:
-                cycle_names.append(reference_acquisition.optional_cycle_name)
-            else:
-                cycle_names.append(f"cycle{reference_acquisition.acquisition_ID}")
+            cycle_names.append(reference_acquisition.cycle_name)
 
         # Create a single merged output acquisition.
         new_acquisition_id = max(acquisition_ids) + 1
