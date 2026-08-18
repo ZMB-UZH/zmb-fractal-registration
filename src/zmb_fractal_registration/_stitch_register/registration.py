@@ -22,22 +22,92 @@ from zmb_fractal_registration.stitch_and_register_init import TileCorrectionMode
 
 logger = logging.getLogger(__name__)
 
-# Output chunks used when fusing. A scalar chunksize is expanded by
-# multiview-stitcher to *every* spatial dimension, so on 3D data it asks for
-# chunks of (z x 1024 x 1024) - tens of millions of voxels. Fusing one chunk
-# holds that chunk plus every input tile overlapping it (resampled to float32)
-# and their blending weights, and dask fuses several chunks concurrently, so
-# peak memory is a multiple of the chunk size. These keep the voxels per chunk
-# the same in 3D as in 2D.
-_CHUNKSIZE_2D = {"y": 1024, "x": 1024}
-_CHUNKSIZE_3D = {"z": 16, "y": 256, "x": 256}
+# Chunks for the *registration references* are sized relative to one input
+# tile. Fusing a chunk holds every tile overlapping it (resampled, plus
+# blending weights) in memory at once, so a chunk larger than a tile pulls in
+# ~(chunk/tile)**2 tiles and the memory grows quadratically. A chunk of one
+# tile keeps that count at ~4 per dimension at *any* pyramid level, which an
+# absolute chunk size cannot do since a tile is a different number of pixels at
+# each level. Measured on 36 tiles / 8 workers: factor 2 needed 0.67 GB, factor
+# 1 0.53 GB, factor 0.5 0.50 GB but 27% more time, and factor 0.25 was worse on
+# both (0.82 GB, 2.6x the time) as per-chunk overhead took over - which is why
+# the references are not simply chunked like their input.
+_CHUNKSIZE_TILE_FACTOR = 1.0
+
+# Chunks below this many pixels along a dimension cost more in per-chunk
+# overhead than they save in memory (a tile can be a handful of pixels at the
+# coarsest pyramid levels, and a chunk that small holds almost nothing).
+_MIN_CHUNKSIZE = 64
+
+# Upper bound on the voxels in one chunk, so that a chunk stays small in
+# absolute terms even where a tile does not: at full resolution a tile can be
+# millions of voxels, and tracking it exactly would undo the point of chunking.
+# 2**24 is what the previous fixed 1024x1024 chunks held in 2D.
+_MAX_CHUNK_VOXELS = 2**24
+
+
+def _cap_chunk_voxels(chunks: dict[str, int]) -> dict[str, int]:
+    """Shrink chunks until a single chunk fits the voxel budget.
+
+    Every dimension shrinks by the same factor, rounding down so the result
+    cannot come back over the budget. No minimum is applied: staying inside the
+    budget matters more than avoiding small chunks, since exceeding it is what
+    runs a job out of memory. Dimensions already at 1 cannot shrink further, so
+    the pass repeats with the remaining ones - a store chunked one plane at a
+    time (z=1) would otherwise stay over budget however far y and x shrink.
+    """
+    chunks = dict(chunks)
+    for _ in range(len(chunks)):
+        if int(np.prod(list(chunks.values()))) <= _MAX_CHUNK_VOXELS:
+            break
+        shrinkable = {dim: size for dim, size in chunks.items() if size > 1}
+        if not shrinkable:
+            break
+        n_shrinkable = int(np.prod(list(shrinkable.values())))
+        fixed = int(np.prod([s for d, s in chunks.items() if d not in shrinkable]))
+        scale = (_MAX_CHUNK_VOXELS / (fixed * n_shrinkable)) ** (1 / len(shrinkable))
+        chunks = {
+            dim: max(1, int(size * scale)) if dim in shrinkable else size
+            for dim, size in chunks.items()
+        }
+    return chunks
+
+
+def _registration_chunksize(sims: list) -> dict[str, int]:
+    """Chunks for fusing a registration reference, scaled to the input tile.
+
+    Deliberately independent of how the input happens to be chunked: these
+    images are fused repeatedly (once per tile registered against them), so
+    chunks smaller than a tile pay their per-chunk overhead many times over.
+    """
+    tile_shape = si_utils.get_shape_from_sim(sims[0], asarray=False)
+    return _cap_chunk_voxels(
+        {
+            dim: max(_MIN_CHUNKSIZE, round(_CHUNKSIZE_TILE_FACTOR * size))
+            for dim, size in tile_shape.items()
+        }
+    )
 
 
 def _output_chunksize(sims: list) -> dict[str, int]:
-    """Per-dimension output chunks for fusing the given spatial images."""
+    """Chunks for the fused output image: the input tiles' own chunking.
+
+    This size is also written as the chunking of the output OME-Zarr, so
+    inheriting it keeps the output laid out like the images it was built from.
+    Tiles are read as ROIs from their store, so their chunks never exceed a
+    tile - which is exactly the bound the fusion needs anyway. Chunks are only
+    shrunk if the input carries pathologically large ones.
+    """
     spatial_dims = si_utils.get_spatial_dims_from_sim(sims[0])
-    template = _CHUNKSIZE_3D if "z" in spatial_dims else _CHUNKSIZE_2D
-    return {dim: template[dim] for dim in spatial_dims}
+    data = sims[0].data
+    if hasattr(data, "chunksize"):
+        chunks = dict(
+            zip(spatial_dims, data.chunksize[-len(spatial_dims) :], strict=True)
+        )
+    else:
+        # Not a chunked array; fall back to the tile itself.
+        chunks = si_utils.get_shape_from_sim(sims[0], asarray=False)
+    return _cap_chunk_voxels(chunks)
 
 
 def _fuse_masked(
@@ -67,7 +137,7 @@ def _fuse_masked(
     registration references, so keeping the original pixel values is preferable
     to smoothing them.
     """
-    chunksize = _output_chunksize(sims)
+    chunksize = _registration_chunksize(sims)
     canvas_kwargs = {
         "output_origin": output_origin,
         "output_shape": output_shape,
@@ -111,7 +181,9 @@ def _stitch_and_fuse_reference(
     it.
 
     Returns a spatial image (down-sampled, lazy) that covers the full stitched
-    FOV and has NaN outside the tile coverage area.
+    FOV and has NaN outside the tile coverage area. It stays lazy on purpose:
+    registering a tile against it only computes the chunks its overlap region
+    touches, so the whole image is never materialized (see _output_chunksize).
     """
     registration.register(
         msims_ref,
@@ -126,6 +198,15 @@ def _stitch_and_fuse_reference(
     )
 
 
+def _stack_props(msim, transform_key: str):
+    """Stack properties of a tile in world space, without non-spatial dims."""
+    sim = msi_utils.get_sim_from_msim(msim)
+    nsdims = si_utils.get_nonspatial_dims_from_sim(sim)
+    if nsdims:
+        sim = si_utils.sim_sel_coords(sim, {nd: sim.coords[nd][0] for nd in nsdims})
+    return si_utils.get_stack_properties_from_sim(sim, transform_key=transform_key)
+
+
 def _has_overlap_with_reference_tiles(
     msim, ref_msims: list, transform_key: str, ref_transform_key: str
 ) -> bool:
@@ -137,22 +218,9 @@ def _has_overlap_with_reference_tiles(
     A return value of False means the tile does not spatially overlap with
     any reference tile and registration would produce an unreliable result.
     """
-    sim = msi_utils.get_sim_from_msim(msim)
-    nsdims = si_utils.get_nonspatial_dims_from_sim(sim)
-    if nsdims:
-        sim = si_utils.sim_sel_coords(sim, {nd: sim.coords[nd][0] for nd in nsdims})
-    tile_sp = si_utils.get_stack_properties_from_sim(sim, transform_key=transform_key)
-
+    tile_sp = _stack_props(msim, transform_key)
     for ref_msim in ref_msims:
-        ref_sim = msi_utils.get_sim_from_msim(ref_msim)
-        ref_nsdims = si_utils.get_nonspatial_dims_from_sim(ref_sim)
-        if ref_nsdims:
-            ref_sim = si_utils.sim_sel_coords(
-                ref_sim, {nd: ref_sim.coords[nd][0] for nd in ref_nsdims}
-            )
-        ref_sp = si_utils.get_stack_properties_from_sim(
-            ref_sim, transform_key=ref_transform_key
-        )
+        ref_sp = _stack_props(ref_msim, ref_transform_key)
         overlap_area, _ = mv_graph.get_overlap_between_pair_of_stack_props(
             tile_sp, ref_sp
         )
@@ -169,6 +237,12 @@ def _register_cycle_tiles(
     init_transform_key: str = "fractal_input",
 ) -> list[int]:
     """Register all tiles in one non-reference cycle against the fused reference.
+
+    `sim_fused_ref` stays lazy: multiview-stitcher crops both images to their
+    overlap region before computing anything, and fusion only materializes the
+    tiles overlapping each output chunk, so a tile's registration computes just
+    the few chunks its own footprint touches. That only holds while the chunks
+    are no larger than a tile, which is what _output_chunksize guarantees.
 
     Tiles that have no spatial overlap with any reference tile are skipped and
     their indices are returned for re-registration in Step 5.
@@ -189,6 +263,8 @@ def _register_cycle_tiles(
         ):
             no_overlap_indices.append(i)
             continue
+        # A fresh msim per tile: register() writes its result onto every msim it
+        # is given, so sharing one across the delayed tasks would be a data race.
         task = delayed(registration.register)(
             [msi_utils.get_msim_from_sim(sim_fused_ref), msim],
             reg_channel=reg_channel,

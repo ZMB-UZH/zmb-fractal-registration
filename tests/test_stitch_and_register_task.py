@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import dask.array as da
 import numpy as np
 import pytest
 from multiview_stitcher import msi_utils, param_utils
@@ -39,6 +40,7 @@ from zmb_fractal_registration._stitch_register.registration import (
     _fuse_masked,
     _output_chunksize,
     _register_leftover_tiles,
+    _registration_chunksize,
 )
 from zmb_fractal_registration._stitch_register.sim_geometry import _xaffine_to_matrix
 from zmb_fractal_registration.stitch_and_register_init import (
@@ -542,28 +544,121 @@ def _chunk_test_sim(z_planes: int | None, offset: float = 0.0):
     )
 
 
-def test_output_chunksize_is_per_dimension():
-    """3D fusion gets its own chunk shape instead of a scalar on every axis."""
-    assert _output_chunksize([_chunk_test_sim(None)]) == {"y": 1024, "x": 1024}
-    assert _output_chunksize([_chunk_test_sim(40)]) == {"z": 16, "y": 256, "x": 256}
+def test_registration_chunksize_tracks_the_tile_size():
+    """A tile that fits the voxel budget is used as the chunk verbatim."""
+    assert _registration_chunksize([_chunk_test_sim(None)]) == {"y": 300, "x": 300}
 
 
-def test_fused_3d_chunks_do_not_span_full_z():
-    """A 3D fused image must not be chunked as a single slab along z.
+def test_registration_chunksize_has_a_floor():
+    """Tiny tiles (coarse pyramid levels) do not produce tiny chunks."""
+    tiny = si_utils.get_sim_from_array(
+        np.ones((1, 8, 8), dtype=np.uint16),
+        dims=["c", "y", "x"],
+        scale={"y": 1.0, "x": 1.0},
+        c_coords=["DAPI"],
+        transform_key="affine_registered",
+    )
+    assert _registration_chunksize([tiny]) == {"y": 64, "x": 64}
 
-    A scalar chunksize is expanded to every spatial dimension, so it asked for
-    z x 1024 x 1024 chunks - the whole z range at once, which is what made
-    fusing 3D data blow up in memory.
+
+def test_registration_chunksize_caps_large_tiles():
+    """A full-resolution tile is too big to use as a chunk verbatim.
+
+    Without the cap a 2048x2048x50 tile would ask for a 200M-voxel chunk, which
+    holds several GB once the overlapping tiles are resampled into it.
     """
-    z_planes = 40
-    sims = [_chunk_test_sim(z_planes), _chunk_test_sim(z_planes, offset=50.0)]
+    big = si_utils.get_sim_from_array(
+        np.ones((1, 50, 2048, 2048), dtype=np.uint16),
+        dims=["c", "z", "y", "x"],
+        scale={"z": 1.0, "y": 0.325, "x": 0.325},
+        c_coords=["DAPI"],
+        transform_key="affine_registered",
+    )
+    chunks = _registration_chunksize([big])
 
-    fused = _fuse_masked(sims)  # lazy, nothing is computed here
+    assert np.prod(list(chunks.values())) <= 2**20
+    # still smaller than the tile in every dimension, so a chunk cannot span
+    # more than one tile
+    for dim, size in {"z": 50, "y": 2048, "x": 2048}.items():
+        assert chunks[dim] <= size
 
-    chunks = fused.chunksizes
-    assert max(chunks["z"]) <= 16 < z_planes
-    assert max(chunks["y"]) <= 256
-    assert max(chunks["x"]) <= 256
+
+def test_registration_chunksize_caps_3d_tiles():
+    """A 3D tile blows the voxel budget well before a 2D one does."""
+    chunks = _registration_chunksize([_chunk_test_sim(40)])
+
+    assert np.prod(list(chunks.values())) <= 2**20
+    for dim, size in {"z": 40, "y": 300, "x": 300}.items():
+        assert chunks[dim] < size
+
+
+def _dask_tile(chunks: tuple[int, ...], shape=(1, 40, 300, 300)):
+    """A 3D tile backed by a dask array with an explicit chunking."""
+    return si_utils.get_sim_from_array(
+        da.ones(shape, dtype=np.uint16, chunks=chunks),
+        dims=["c", "z", "y", "x"],
+        scale={"z": 1.0, "y": 0.325, "x": 0.325},
+        c_coords=["DAPI"],
+        transform_key="affine_registered",
+    )
+
+
+def test_output_chunksize_inherits_the_input_chunking():
+    """The fused output is chunked like the tiles it was built from.
+
+    This size is also written as the on-disk chunking of the output OME-Zarr,
+    so it should follow the input rather than a number derived from a memory
+    budget.
+    """
+    assert _output_chunksize([_dask_tile((1, 10, 128, 128))]) == {
+        "z": 10,
+        "y": 128,
+        "x": 128,
+    }
+    # a store written one z-plane at a time, which is a common OME-Zarr layout
+    assert _output_chunksize([_dask_tile((1, 1, 256, 256))]) == {
+        "z": 1,
+        "y": 256,
+        "x": 256,
+    }
+
+
+def test_output_chunksize_caps_pathological_input_chunking():
+    """A store with huge chunks must not dictate a huge fusion chunk.
+
+    A whole-plane chunk would hold gigabytes once every overlapping tile is
+    resampled into it, so the inherited size is still capped.
+    """
+    chunks = _output_chunksize(
+        [_dask_tile((1, 1, 5000, 5000), shape=(1, 1, 5000, 5000))]
+    )
+
+    # z is already 1 and cannot shrink, so y and x must absorb the whole cap
+    assert np.prod(list(chunks.values())) <= 2**20
+    assert chunks["z"] == 1
+
+
+def test_output_chunksize_falls_back_for_numpy_tiles():
+    """A tile that is not a chunked array falls back to the tile shape."""
+    assert _output_chunksize([_chunk_test_sim(None)]) == {"y": 300, "x": 300}
+
+
+def test_fused_chunks_never_exceed_the_tile_size():
+    """No fused chunk may span more than one tile, in any dimension.
+
+    A chunk larger than a tile pulls ~(chunk/tile)**2 tiles into memory at once
+    when it is fused. An absolute chunk size cannot guarantee this, because a
+    tile is a different number of pixels at every pyramid level - which is how
+    a whole fused reference once ended up inside a single chunk.
+    """
+    for z_planes in (None, 40):
+        sims = [_chunk_test_sim(z_planes), _chunk_test_sim(z_planes, offset=50.0)]
+        tile_shape = si_utils.get_shape_from_sim(sims[0], asarray=False)
+
+        fused = _fuse_masked(sims)  # lazy, nothing is computed here
+
+        for dim, tile_size in tile_shape.items():
+            assert max(fused.chunksizes[dim]) <= max(tile_size, 64)
 
 
 # ---------------------------------------------------------------------------
