@@ -1,7 +1,7 @@
 """Wrapper to run stitch_and_register_parallel locally without a Fractal server."""
 
 import logging
-from typing import Optional
+from typing import Literal, Optional
 
 from ngio import ChannelSelectionModel
 
@@ -27,7 +27,11 @@ def stitch_and_register(
     cycle_names: Optional[list[str]] = None,
     z_project: bool = True,
     pyramid_level: int = 0,
+    pre_registration: bool = False,
     tile_correction: TileCorrectionModel = TileCorrectionModel(),
+    keep_original_acquisitions: bool = True,
+    fusion_region: Literal["union", "intersection", "intersection_bbox"] = "union",
+    interpolation_order: int = 0,
     show_logs: bool = False,
     log_level: int = logging.INFO,
 ) -> dict:
@@ -53,8 +57,26 @@ def stitch_and_register(
             intensity Z-projection and apply the transforms to the full 3D
             volume. If False, operate on the full volume directly.
         pyramid_level: Pyramid level used for stitching/registration.
+        pre_registration: If True, perform a rough pre-registration of the
+            acquisitions before the accurate stitching and registration. Each
+            acquisition is fused from its original stage coordinates at the
+            coarsest pyramid level, and the fused acquisitions are registered
+            against the reference acquisition as a whole. Use this when the
+            shifts between acquisitions are large compared to the tile overlap
+            and are therefore not recoverable from the stage coordinates alone.
         tile_correction: Settings for correcting non-overlapping tiles and
             filtering outliers. See `TileCorrectionModel` for details.
+        keep_original_acquisitions: If True, keep the original acquisitions.
+            If False, delete them after processing.
+        fusion_region: Which region of the registered cycles to save.
+            'union': save the full extent covered by any cycle.
+            'intersection': tight box of the region covered by every cycle;
+            uncovered pixels inside it are set to 0.
+            'intersection_bbox': largest box fully covered by every cycle
+            (no pixels set to 0).
+        interpolation_order: Spline interpolation order for resampling tiles
+            into the fused output. 0 is nearest-neighbor (preserves
+            original pixel values), 1 is linear.
         show_logs: If True, configure root logging so task logs are printed.
         log_level: Logging level used when show_logs is True.
     """
@@ -82,8 +104,11 @@ def stitch_and_register(
         reference_channel=reference_channel,
         pyramid_level=pyramid_level,
         z_project=z_project,
-        keep_original_acquisitions=True,
+        pre_registration=pre_registration,
+        keep_original_acquisitions=keep_original_acquisitions,
         tile_correction=tile_correction,
+        fusion_region=fusion_region,
+        interpolation_order=interpolation_order,
     )
 
     return stitch_and_register_parallel(
