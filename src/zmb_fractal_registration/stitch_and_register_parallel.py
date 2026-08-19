@@ -287,16 +287,32 @@ def _fuse_cycles(
     _rounded_origin = {k: round(v, 3) for k, v in global_origin.items()}
     logger.info(f"Global output shape: {global_shape}, origin: {_rounded_origin}")
 
+    all_cycle_sims = {
+        cycle: [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
+        for cycle in cycles
+    }
+    # One shared chunk grid for every cycle, inherited from the input tiles
+    # (per-dim minimum across cycles, so no cycle's chunks exceed its tiles).
+    # This is also the on-disk chunking. It must be shared: with per-cycle
+    # chunk sizes, the concat below unifies the cycles' dask chunks into an
+    # irregular grid that no longer matches the on-disk chunks derived from
+    # it, sending zarr through its unaligned read-modify-write path with
+    # several tasks updating the same chunk file concurrently - which can
+    # silently drop updates and, on network storage, fail with
+    # FileNotFoundError on the atomic chunk rename.
+    per_cycle_chunks = [_output_chunksize(all_cycle_sims[cycle]) for cycle in cycles]
+    chunksize = {
+        dim: min(chunks[dim] for chunks in per_cycle_chunks)
+        for dim in per_cycle_chunks[0]
+    }
+    logger.info(f"Output chunks (shared across cycles): {chunksize}.")
+
     sims_fused = {}
     masks_fused = {}
     canvas_coords = None
     for cycle in cycles:
         logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
-        cycle_sims = [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
-        # Inherited from the input tiles, so the output is chunked like the
-        # images it was built from (this is also the on-disk chunking).
-        chunksize = _output_chunksize(cycle_sims)
-        logger.info(f"Cycle '{cycle}': output chunks {chunksize}.")
+        cycle_sims = all_cycle_sims[cycle]
         sims_fused[cycle] = fusion.fuse(
             cycle_sims,
             transform_key="affine_registered",

@@ -247,13 +247,36 @@ def _register_cycle_tiles(
     are no larger than a tile, which is what _output_chunksize guarantees.
 
     Tiles that have no spatial overlap with any reference tile are skipped and
-    their indices are returned for re-registration in Step 5.
+    their indices are returned for re-registration in Step 5. The same happens
+    to tiles whose registration fails: a tile can overlap a reference tile's
+    bounding box while the actual overlap region of the fused reference is all
+    NaN (a coverage hole or seam), which phase correlation cannot handle.
     Overlapping tiles are registered via dask-delayed tasks (computed here).
 
     Returns:
-        no_overlap_indices: Indices of tiles that were skipped due to no overlap.
+        no_overlap_indices: Indices of tiles skipped due to no overlap or a
+            failed registration; both are corrected in Step 5.
     """
+
+    def _register_tile(msim) -> bool:
+        try:
+            registration.register(
+                [msi_utils.get_msim_from_sim(sim_fused_ref), msim],
+                reg_channel=reg_channel,
+                transform_key=init_transform_key,
+                new_transform_key="affine_registered",
+                pre_registration_pruning_method=None,
+                groupwise_resolution_kwargs={"reference_view": 0},
+                reg_res_level=0,
+            )
+            return True
+        # ValueError covers phase correlation choking on a degenerate overlap
+        # region (e.g. all-NaN), which must not take the whole well down.
+        except (mv_graph.NotEnoughOverlapError, ValueError):
+            return False
+
     no_overlap_indices = []
+    registered_indices = []
     delayed_tasks = []
 
     for i, msim in enumerate(msims):
@@ -267,19 +290,19 @@ def _register_cycle_tiles(
             continue
         # A fresh msim per tile: register() writes its result onto every msim it
         # is given, so sharing one across the delayed tasks would be a data race.
-        task = delayed(registration.register)(
-            [msi_utils.get_msim_from_sim(sim_fused_ref), msim],
-            reg_channel=reg_channel,
-            transform_key=init_transform_key,
-            new_transform_key="affine_registered",
-            pre_registration_pruning_method=None,
-            groupwise_resolution_kwargs={"reference_view": 0},
-            reg_res_level=0,
-        )
-        delayed_tasks.append(task)
+        registered_indices.append(i)
+        delayed_tasks.append(delayed(_register_tile)(msim))
 
-    compute(*delayed_tasks)
-    return no_overlap_indices
+    results = compute(*delayed_tasks)
+    for i, success in zip(registered_indices, results, strict=True):
+        if not success:
+            logger.warning(
+                f"Tile {i}: registration against the fused reference failed "
+                "(degenerate or all-NaN overlap region); deferring the tile "
+                "to leftover correction."
+            )
+            no_overlap_indices.append(i)
+    return sorted(no_overlap_indices)
 
 
 def _collect_shifts(

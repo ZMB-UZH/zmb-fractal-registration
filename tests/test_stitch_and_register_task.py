@@ -709,6 +709,72 @@ def test_order0_fusion_is_exact_after_grid_snapping():
     assert sorted(np.unique(arr).tolist()) == [100, 200]
 
 
+def test_fused_output_chunks_are_uniform_across_cycles():
+    """Cycles with different input chunkings fuse onto one regular chunk grid.
+
+    Per-cycle chunk sizes made xr.concat unify the dask chunks into an
+    irregular grid that no longer matched the on-disk chunking derived from
+    it, sending zarr through its unaligned read-modify-write path with several
+    tasks updating the same chunk file concurrently - silently dropping
+    updates and failing on network storage.
+    """
+    from types import SimpleNamespace
+
+    def tile_with_chunks(value, chunks):
+        sim = si_utils.get_sim_from_array(
+            da.full((1, 96, 96), value, dtype=np.uint16, chunks=(1, *chunks)),
+            dims=["c", "y", "x"],
+            scale={"y": _SNAP_S, "x": _SNAP_S},
+            translation={"y": 0.0, "x": 0.0},
+            c_coords=["ch"],
+            transform_key="affine_registered",
+        )
+        return msi_utils.get_msim_from_sim(sim, scale_factors=[])
+
+    msims_fusion = {
+        "A": [tile_with_chunks(100, (40, 40))],
+        "B": [tile_with_chunks(200, (32, 32))],
+    }
+    containers = {
+        "A": SimpleNamespace(get_image=lambda: SimpleNamespace(axes=["c", "y", "x"]))
+    }
+
+    fused = _fuse_cycles(containers, msims_fusion, ["A", "B"], "A", "union", 0)
+
+    # A regular grid: every chunk except the last must equal the first, in
+    # every spatial dimension and identically for all channels.
+    for dim in ("y", "x"):
+        sizes = fused.chunksizes[dim]
+        assert all(s == sizes[0] for s in sizes[:-1])
+        assert sizes[0] == 32  # the per-dim minimum across cycles
+
+
+def test_register_cycle_tiles_survives_registration_failure(monkeypatch):
+    """A tile whose registration crashes is deferred to leftover correction.
+
+    A tile can overlap a reference tile's bounding box while the overlap
+    region of the fused reference is all NaN (coverage hole or seam), which
+    used to crash the whole well with "zero-size array to reduction operation
+    minimum" inside phase correlation.
+    """
+    from zmb_fractal_registration._stitch_register import registration as regmod
+
+    ref_msims = [_tile_msim(0.0, 0.0, registered_shift=0.0)]
+    sim_fused_ref = _fuse_masked([msi_utils.get_sim_from_msim(m) for m in ref_msims])
+    moving = [_tile_msim(10.0, 10.0)]  # overlaps the reference tile's bbox
+
+    def failing_register(*args, **kwargs):
+        raise ValueError("zero-size array to reduction operation minimum")
+
+    monkeypatch.setattr(regmod.registration, "register", failing_register)
+
+    leftovers = regmod._register_cycle_tiles(
+        moving, sim_fused_ref, "DAPI", ref_msims, "fractal_input"
+    )
+
+    assert leftovers == [0]
+
+
 # ---------------------------------------------------------------------------
 # Integration tests: non-overlapping and fallback tile handling
 # ---------------------------------------------------------------------------
