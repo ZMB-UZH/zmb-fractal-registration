@@ -14,20 +14,20 @@
 #   those to scratch with da.store and reading them back lazily would remove the
 #   recomputation and bound the memory at any pyramid level, at the cost of disk
 #   I/O and temp-file handling.
-# - interpolation_order=0 leaves a 1-pixel zero frame around the outer edge of a
-#   fused cycle whenever the output canvas is not aligned to that cycle's pixel
-#   grid (i.e. whenever the registration shift is sub-pixel). The frame follows
-#   the canvas edge, not the tile edge, so shrinking the output box does not
-#   remove it - meaning fusion_region='intersection_bbox' cannot fully guarantee
-#   "no pixels set to 0" at order 0. order=1 is unaffected. Fixing it likely
-#   means snapping global_origin onto the reference cycle's pixel grid (which
-#   would also stop order-0 nearest-neighbour from introducing up to half a
-#   pixel of jitter per tile), though non-reference cycles cannot be aligned at
-#   the same time. Possibly an off-by-one in multiview-stitcher's order-0
-#   resampling path - worth checking upstream first.
+# - report upstream (multiview-stitcher): at interpolation_order=0 the per-chunk
+#   tile crop in fusion has `interpolation_order` (i.e. zero) pixels of margin
+#   and scipy maps coordinates even slightly outside the crop to cval, which
+#   produces one-pixel zero seams at chunk borders and the canvas edge whenever
+#   a tile sits at a sub-pixel offset - and, at plate-scale world coordinates
+#   (~1e5 um), even when it does not, since float error exceeds the 10-decimal
+#   rounding of the resampling offsets (likely their "empty z slices in a
+#   fractal task" mystery). The `overlap_in_pixels` fuse() parameter is also
+#   ignored (unconditionally overwritten). The *output* fusion is immune here
+#   thanks to grid snapping (see grid_snap.py), but the order-0 registration
+#   reference fusions (_fuse_masked) can still carry 1-px NaN seams at chunk
+#   borders, which marginally weakens registration.
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Any, Literal
 
@@ -38,6 +38,9 @@ from ngio import ChannelSelectionModel, open_ome_zarr_container
 from ngio.ome_zarr_meta import Channel
 from pydantic import BaseModel, validate_call
 
+from zmb_fractal_registration._stitch_register.grid_snap import (
+    _snap_msims_to_output_grid,
+)
 from zmb_fractal_registration._stitch_register.loading import (
     _get_msims,
     _resolve_registration_channel,
@@ -81,10 +84,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
         pre_registration: If True, roughly align whole cycles against the
             reference cycle before the accurate stitching/registration. Each
             cycle is fused from its stage coordinates at the coarsest pyramid
-            level and registered as a whole, assuming all cycles cover roughly
-            the same area.
-        keep_original_acquisitions: If True, keep the original acquisitions.
-            If False, remove them after processing.
+            level and registered as a whole.
         tile_correction: Settings for correcting non-overlapping tiles and
             filtering outliers.
         fusion_region: Which region of the registered cycles to save.
@@ -104,8 +104,7 @@ class InitArgsStitchAndRegisterParallel(BaseModel):
     reference_channel: ChannelSelectionModel
     pyramid_level: int = 0
     z_project: bool = True
-    pre_registration: bool = False
-    keep_original_acquisitions: bool = True
+    pre_registration: bool = True
     tile_correction: TileCorrectionModel = TileCorrectionModel()
     fusion_region: Literal["union", "intersection", "intersection_bbox"] = "union"
     interpolation_order: int = 0
@@ -276,21 +275,44 @@ def _fuse_cycles(
     spacing_ref = get_spacing_from_sim(
         msi_utils.get_sim_from_msim(msims_fusion[ref_cycle][0]), asarray=False
     )
+    if interpolation_order == 0:
+        # Order 0 only preserves original pixel values (and avoids one-pixel
+        # zero seams) if the tiles sit exactly on the output grid; see
+        # grid_snap for the details. The bbox below is computed from the
+        # snapped positions, so the canvas lands on the same lattice.
+        msims_fusion = _snap_msims_to_output_grid(msims_fusion, cycles, spacing_ref)
     global_origin, global_shape = _compute_global_bbox(
         msims_fusion, cycles, spacing_ref, fusion_region
     )
     _rounded_origin = {k: round(v, 3) for k, v in global_origin.items()}
     logger.info(f"Global output shape: {global_shape}, origin: {_rounded_origin}")
 
+    all_cycle_sims = {
+        cycle: [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
+        for cycle in cycles
+    }
+    # One shared chunk grid for every cycle, inherited from the input tiles
+    # (per-dim minimum across cycles, so no cycle's chunks exceed its tiles).
+    # This is also the on-disk chunking. It must be shared: with per-cycle
+    # chunk sizes, the concat below unifies the cycles' dask chunks into an
+    # irregular grid that no longer matches the on-disk chunks derived from
+    # it, sending zarr through its unaligned read-modify-write path with
+    # several tasks updating the same chunk file concurrently - which can
+    # silently drop updates and, on network storage, fail with
+    # FileNotFoundError on the atomic chunk rename.
+    per_cycle_chunks = [_output_chunksize(all_cycle_sims[cycle]) for cycle in cycles]
+    chunksize = {
+        dim: min(chunks[dim] for chunks in per_cycle_chunks)
+        for dim in per_cycle_chunks[0]
+    }
+    logger.info(f"Output chunks (shared across cycles): {chunksize}.")
+
     sims_fused = {}
     masks_fused = {}
+    canvas_coords = None
     for cycle in cycles:
         logger.info(f"Cycle '{cycle}': fusing {len(msims_fusion[cycle])} tile(s).")
-        cycle_sims = [msi_utils.get_sim_from_msim(msim) for msim in msims_fusion[cycle]]
-        # Inherited from the input tiles, so the output is chunked like the
-        # images it was built from (this is also the on-disk chunking).
-        chunksize = _output_chunksize(cycle_sims)
-        logger.info(f"Cycle '{cycle}': output chunks {chunksize}.")
+        cycle_sims = all_cycle_sims[cycle]
         sims_fused[cycle] = fusion.fuse(
             cycle_sims,
             transform_key="affine_registered",
@@ -310,8 +332,27 @@ def _fuse_cycles(
                 output_origin=global_origin,
                 output_shape=global_shape,
             )
+        # All cycles share one output canvas, but multiview-stitcher recomputes
+        # the coordinates per cycle with float rounding that can differ in the
+        # last bits (~1e-12). xarray alignment treats such coordinates as
+        # different positions: the concat below would then pad every cycle with
+        # NaN over the other cycles' extent, and the NaN reaches the integer
+        # output as garbage values. Snap all cycles onto identical coordinates.
+        if canvas_coords is None:
+            canvas_coords = {
+                dim: sims_fused[cycle].coords[dim].values for dim in global_shape
+            }
+        else:
+            sims_fused[cycle] = sims_fused[cycle].assign_coords(canvas_coords)
+            if cycle in masks_fused:
+                masks_fused[cycle] = masks_fused[cycle].assign_coords(canvas_coords)
 
-    sim_fused_all = xr.concat([sims_fused[cycle] for cycle in cycles], dim="c")
+    # join="exact": the cycles are on identical coordinates by construction
+    # above; anything else is a bug that must fail loudly instead of silently
+    # growing the canvas.
+    sim_fused_all = xr.concat(
+        [sims_fused[cycle] for cycle in cycles], dim="c", join="exact"
+    )
 
     if fusion_region == "intersection":
         # Keep only pixels covered by every cycle; zero the rest (preserves dtype).
@@ -493,27 +534,14 @@ def stitch_and_register_parallel(
             "zarr_url": zarr_url,
             "origin": init_args.zarr_urls_to_register[0],
             "attributes": {
-                "acquisition": Path(zarr_url).as_posix().split("/")[-1],
+                "acquisition": Path(zarr_url).name,
             },
             # TODO: better passing of acquisition metadata (maybe pass from init task)
         }
     ]
 
-    if init_args.keep_original_acquisitions:
-        logger.info("Keeping original acquisitions. Task complete.")
-        return {"image_list_updates": image_list_updates}
-
-    logger.info(
-        f"Removing {len(init_args.zarr_urls_to_register)} original acquisition(s)..."
-    )
-    for url in init_args.zarr_urls_to_register:
-        logger.info(f"Deleting original acquisition at '{url}'.")
-        shutil.rmtree(url)
     logger.info("Task complete.")
-    return {
-        "image_list_updates": image_list_updates,
-        "image_list_removals": init_args.zarr_urls_to_register,
-    }
+    return {"image_list_updates": image_list_updates}
 
 
 if __name__ == "__main__":

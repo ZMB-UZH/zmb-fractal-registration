@@ -18,11 +18,11 @@ Key features:
 - Each acquisition can be assigned an optional **cycle name** to disambiguate channels from different rounds. If not specified, cycle names default to `cycle0`, `cycle1`, etc.
 - `pre_registration` (disabled by default) adds a rough alignment step in front of the accurate stitching and registration: every acquisition is fused from its original stage coordinates at the **coarsest pyramid level**, and those fused acquisitions are registered against the fused reference acquisition as a whole. The resulting per-acquisition shift is used as the starting point of the accurate registration. Enable it when the shift between acquisitions is large compared to the tile overlap - in that case the individual tiles of a cycle would otherwise not overlap the reference tile they belong to, and the per-tile registration cannot recover the shift. The step does **not** assume the stage coordinates are approximately right, since that is what it exists to correct: each acquisition is anchored on the origin of its own tile bounding box (i.e. the acquisitions are assumed to cover roughly the same area) and all of them are fused onto one shared canvas covering every acquisition's extent. Shifts of any size are therefore recoverable, including ones that place the acquisitions' stage coordinates completely apart. Acquisitions whose pre-registration fails (e.g. no image overlap at all) log a warning and keep their raw stage coordinates.
 - The extent of the fused output is controlled by `fusion_region` (see **Outputs**), so cycles that do not cover exactly the same area can be cropped down to their common region.
-- `interpolation_order` sets the spline order used when resampling tiles into the fused output. The default of `0` (nearest neighbour) preserves the original pixel values exactly.
+- `interpolation_order` sets the spline order used when resampling tiles into the fused output. The default of `0` (nearest neighbour) preserves the original pixel values exactly: each tile's registered position is rounded to the output pixel grid (a rigid shift of at most half a pixel per tile - the same error budget nearest-neighbour resampling has per pixel), after which the fusion places original pixels one-to-one without any resampling artifacts. Use `1` (linear) if sub-pixel accurate positioning matters more than unaltered pixel values.
 
 ### Outputs
 
-Creates a new OME-Zarr acquisition named **`fused`** within the same plate. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.
+Creates a **new OME-Zarr plate**, named after the original with `new_plate_suffix` appended (default: `plate.zarr` -> `plate_fused.zarr`), holding one fused image per well under a single acquisition named `fused`. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.
 
 After registration the cycles rarely cover exactly the same area, so `fusion_region` selects which part of that area is written:
 
@@ -31,8 +31,6 @@ After registration the cycles rarely cover exactly the same area, so `fusion_reg
 - **`intersection_bbox`** - the largest rectangular box that is *entirely* covered by every cycle. No pixels are set to `0`, at the cost of discarding parts of the common region that do not fit into a single box.
 
 `intersection` and `intersection_bbox` differ only when the covered region is not itself rectangular (e.g. a missing or badly shifted tile punches a hole in it). If the cycles share no common region at all, both raise an error.
-
-If `keep_original_acquisitions` is `False`, the individual input acquisitions are removed from the plate after fusion.
 
 ### Limitations
 

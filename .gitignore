@@ -119,3 +119,6 @@ ENV/
 # Notebooks
 *.ipynb
 .ipynb_checkpoints
+# Local scratch data (job archives, screenshots, personal scripts)
+local/
+examples/

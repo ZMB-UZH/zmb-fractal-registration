@@ -17,7 +17,7 @@
         "2D",
         "3D"
       ],
-      "docs_info": "### Purpose\n\nStitches together tiles from multiple acquisitions of a plate and registers them into a single fused image per well. This task is designed for multi-cycle imaging experiments where the same well is imaged across multiple acquisitions (e.g., sequential rounds of staining).\n\nThe workflow proceeds in three steps:\n\n1. **Stitching** - tiles within the reference acquisition are stitched together using phase cross correlation.\n2. **Registration** - tiles from all other acquisitions are independently registered to the stitched reference image, correcting for shifts between cycles.\n3. **Fusion** - all cycles are resampled onto a shared output canvas and written as a single image per well.\n\nOptionally, a rough **pre-registration** runs before step 1 (see `pre_registration` below).\n\nKey features:\n- Uses the [`multiview_stitcher`](https://multiview-stitcher.readthedocs.io) package for stitching and registration.\n- Conceptually similar to [Ashlar](https://github.com/labsyspharm/ashlar), but also supports **3D volumes** in addition to 2D.\n- When `z_project` is enabled (default), stitching and registration are computed on a maximum-intensity Z-projection, and the resulting transformations are applied to the full 3D volume - reducing computation time.\n- All acquisitions to process can be explicitly selected via `acquisitions_to_include`; if omitted, all acquisitions in the plate are used.\n- Each acquisition can be assigned an optional **cycle name** to disambiguate channels from different rounds. If not specified, cycle names default to `cycle0`, `cycle1`, etc.\n- `pre_registration` (disabled by default) adds a rough alignment step in front of the accurate stitching and registration: every acquisition is fused from its original stage coordinates at the **coarsest pyramid level**, and those fused acquisitions are registered against the fused reference acquisition as a whole. The resulting per-acquisition shift is used as the starting point of the accurate registration. Enable it when the shift between acquisitions is large compared to the tile overlap - in that case the individual tiles of a cycle would otherwise not overlap the reference tile they belong to, and the per-tile registration cannot recover the shift. The step does **not** assume the stage coordinates are approximately right, since that is what it exists to correct: each acquisition is anchored on the origin of its own tile bounding box (i.e. the acquisitions are assumed to cover roughly the same area) and all of them are fused onto one shared canvas covering every acquisition's extent. Shifts of any size are therefore recoverable, including ones that place the acquisitions' stage coordinates completely apart. Acquisitions whose pre-registration fails (e.g. no image overlap at all) log a warning and keep their raw stage coordinates.\n- The extent of the fused output is controlled by `fusion_region` (see **Outputs**), so cycles that do not cover exactly the same area can be cropped down to their common region.\n- `interpolation_order` sets the spline order used when resampling tiles into the fused output. The default of `0` (nearest neighbour) preserves the original pixel values exactly.\n\n### Outputs\n\nCreates a new OME-Zarr acquisition named **`fused`** within the same plate. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.\n\nAfter registration the cycles rarely cover exactly the same area, so `fusion_region` selects which part of that area is written:\n\n- **`union`** (default) - the full extent covered by *any* cycle. Nothing is cropped, but pixels near the border are present in only some cycles; where a cycle has no data it stays at the fill value.\n- **`intersection`** - the tight bounding box around the region covered by *every* cycle. Pixels inside that box that are not covered by all cycles are set to `0`. Use this when you want the smallest output that still contains the whole common region.\n- **`intersection_bbox`** - the largest rectangular box that is *entirely* covered by every cycle. No pixels are set to `0`, at the cost of discarding parts of the common region that do not fit into a single box.\n\n`intersection` and `intersection_bbox` differ only when the covered region is not itself rectangular (e.g. a missing or badly shifted tile punches a hole in it). If the cycles share no common region at all, both raise an error.\n\nIf `keep_original_acquisitions` is `False`, the individual input acquisitions are removed from the plate after fusion.\n\n### Limitations\n\n- Each acquisition must contain a **`FOV_ROI_table`** with original stage coordinates to initialize the stitching.\n- Supports only **one image per acquisition per well** - plates with multiple fields of view stored as separate images per acquisition are not supported.\n- Large shifts between cycles that are not represented in the original stage coordinates are only handled when `pre_registration` is enabled, which assumes the acquisitions cover roughly the same area. A single tile with a broken stage coordinate widens the shared registration canvas (this is logged as a warning) but does not affect the result.",
+      "docs_info": "### Purpose\n\nStitches together tiles from multiple acquisitions of a plate and registers them into a single fused image per well. This task is designed for multi-cycle imaging experiments where the same well is imaged across multiple acquisitions (e.g., sequential rounds of staining).\n\nThe workflow proceeds in three steps:\n\n1. **Stitching** - tiles within the reference acquisition are stitched together using phase cross correlation.\n2. **Registration** - tiles from all other acquisitions are independently registered to the stitched reference image, correcting for shifts between cycles.\n3. **Fusion** - all cycles are resampled onto a shared output canvas and written as a single image per well.\n\nOptionally, a rough **pre-registration** runs before step 1 (see `pre_registration` below).\n\nKey features:\n- Uses the [`multiview_stitcher`](https://multiview-stitcher.readthedocs.io) package for stitching and registration.\n- Conceptually similar to [Ashlar](https://github.com/labsyspharm/ashlar), but also supports **3D volumes** in addition to 2D.\n- When `z_project` is enabled (default), stitching and registration are computed on a maximum-intensity Z-projection, and the resulting transformations are applied to the full 3D volume - reducing computation time.\n- All acquisitions to process can be explicitly selected via `acquisitions_to_include`; if omitted, all acquisitions in the plate are used.\n- Each acquisition can be assigned an optional **cycle name** to disambiguate channels from different rounds. If not specified, cycle names default to `cycle0`, `cycle1`, etc.\n- `pre_registration` (disabled by default) adds a rough alignment step in front of the accurate stitching and registration: every acquisition is fused from its original stage coordinates at the **coarsest pyramid level**, and those fused acquisitions are registered against the fused reference acquisition as a whole. The resulting per-acquisition shift is used as the starting point of the accurate registration. Enable it when the shift between acquisitions is large compared to the tile overlap - in that case the individual tiles of a cycle would otherwise not overlap the reference tile they belong to, and the per-tile registration cannot recover the shift. The step does **not** assume the stage coordinates are approximately right, since that is what it exists to correct: each acquisition is anchored on the origin of its own tile bounding box (i.e. the acquisitions are assumed to cover roughly the same area) and all of them are fused onto one shared canvas covering every acquisition's extent. Shifts of any size are therefore recoverable, including ones that place the acquisitions' stage coordinates completely apart. Acquisitions whose pre-registration fails (e.g. no image overlap at all) log a warning and keep their raw stage coordinates.\n- The extent of the fused output is controlled by `fusion_region` (see **Outputs**), so cycles that do not cover exactly the same area can be cropped down to their common region.\n- `interpolation_order` sets the spline order used when resampling tiles into the fused output. The default of `0` (nearest neighbour) preserves the original pixel values exactly: each tile's registered position is rounded to the output pixel grid (a rigid shift of at most half a pixel per tile - the same error budget nearest-neighbour resampling has per pixel), after which the fusion places original pixels one-to-one without any resampling artifacts. Use `1` (linear) if sub-pixel accurate positioning matters more than unaltered pixel values.\n\n### Outputs\n\nCreates a **new OME-Zarr plate**, named after the original with `new_plate_suffix` appended (default: `plate.zarr` -> `plate_fused.zarr`), holding one fused image per well under a single acquisition named `fused`. For each well, the fused image contains **all channels from all registered acquisitions**, concatenated along the channel axis. Each channel is renamed with a `_{cycle_name}` suffix (e.g., `DAPI_cycle0`, `GFP_cycle1`) to distinguish channels across cycles.\n\nAfter registration the cycles rarely cover exactly the same area, so `fusion_region` selects which part of that area is written:\n\n- **`union`** (default) - the full extent covered by *any* cycle. Nothing is cropped, but pixels near the border are present in only some cycles; where a cycle has no data it stays at the fill value.\n- **`intersection`** - the tight bounding box around the region covered by *every* cycle. Pixels inside that box that are not covered by all cycles are set to `0`. Use this when you want the smallest output that still contains the whole common region.\n- **`intersection_bbox`** - the largest rectangular box that is *entirely* covered by every cycle. No pixels are set to `0`, at the cost of discarding parts of the common region that do not fit into a single box.\n\n`intersection` and `intersection_bbox` differ only when the covered region is not itself rectangular (e.g. a missing or badly shifted tile punches a hole in it). If the cycles share no common region at all, both raise an error.\n\n### Limitations\n\n- Each acquisition must contain a **`FOV_ROI_table`** with original stage coordinates to initialize the stitching.\n- Supports only **one image per acquisition per well** - plates with multiple fields of view stored as separate images per acquisition are not supported.\n- Large shifts between cycles that are not represented in the original stage coordinates are only handled when `pre_registration` is enabled, which assumes the acquisitions cover roughly the same area. A single tile with a broken stage coordinate widens the shared registration canvas (this is logged as a warning) but does not affect the result.",
       "type": "compound",
       "executable_non_parallel": "stitch_and_register_init.py",
       "executable_parallel": "stitch_and_register_parallel.py",
@@ -32,6 +32,7 @@
       "args_schema_non_parallel": {
         "$defs": {
           "AcquisitionInputModel": {
+            "additionalProperties": false,
             "description": "Input model for acquisitions.",
             "properties": {
               "acquisition_ID": {
@@ -52,6 +53,7 @@
             "type": "object"
           },
           "AcquisitionsSelectionModel": {
+            "additionalProperties": false,
             "description": "Model to select which acquisitions to process.",
             "properties": {
               "use_all_acquisitions": {
@@ -100,6 +102,7 @@
             "type": "object"
           },
           "TileCorrectionModel": {
+            "additionalProperties": false,
             "description": "Settings for correcting non-overlapping tiles and filtering outliers.",
             "properties": {
               "correction_method": {
@@ -146,7 +149,7 @@
           "zarr_dir": {
             "title": "Zarr Dir",
             "type": "string",
-            "description": "Not used for this task. (Standard argument for Fractal tasks, managed by Fractal server)."
+            "description": "Directory in which the new plate holding the fused output is created. (Standard argument for Fractal tasks, managed by Fractal server)."
           },
           "acquisitions_to_include": {
             "$ref": "#/$defs/AcquisitionsSelectionModel",
@@ -175,6 +178,12 @@
             "title": "Reference Channel",
             "description": "Channel to use as reference for stitching and registration."
           },
+          "new_plate_suffix": {
+            "default": "fused",
+            "title": "New Plate Suffix",
+            "type": "string",
+            "description": "Suffix for the new plate holding the fused output: the fused images of `plate.zarr` are written to `plate_{new_plate_suffix}.zarr` inside `zarr_dir`. An existing plate at that path is overwritten."
+          },
           "pyramid_level": {
             "default": 0,
             "title": "Pyramid Level",
@@ -188,10 +197,10 @@
             "description": "If True, calculate stitching/registration on a z-projection and apply the calculated transformations to the full 3D image. If False, operate on the full image volume. Only used in case of 3D images."
           },
           "pre_registration": {
-            "default": false,
+            "default": true,
             "title": "Pre Registration",
             "type": "boolean",
-            "description": "If True, perform a rough pre-registration of the acquisitions before the accurate stitching and registration. Each acquisition is fused from its original stage coordinates at the coarsest pyramid level, and the fused acquisitions are registered against the reference acquisition as a whole. Use this when the shifts between acquisitions are large compared to the tile overlap and are therefore not recoverable from the stage coordinates alone. Assumes that all acquisitions cover roughly the same area; shifts of any size are recoverable."
+            "description": "If True, perform a rough pre-registration of the acquisitions before the accurate stitching and registration. Use this if there are significant global shifts between acquisitions."
           },
           "tile_correction": {
             "$ref": "#/$defs/TileCorrectionModel",
@@ -202,12 +211,6 @@
             },
             "title": "Tile Correction",
             "description": "Settings for correcting non-overlapping tiles and filtering outliers."
-          },
-          "keep_original_acquisitions": {
-            "default": true,
-            "title": "Keep Original Acquisitions",
-            "type": "boolean",
-            "description": "If True, keep original acquisitions after registration. If False, remove them."
           },
           "fusion_region": {
             "default": "union",
@@ -298,13 +301,8 @@
                 "type": "boolean"
               },
               "pre_registration": {
-                "default": false,
-                "title": "Pre Registration",
-                "type": "boolean"
-              },
-              "keep_original_acquisitions": {
                 "default": true,
-                "title": "Keep Original Acquisitions",
+                "title": "Pre Registration",
                 "type": "boolean"
               },
               "tile_correction": {
@@ -342,6 +340,7 @@
             "type": "object"
           },
           "TileCorrectionModel": {
+            "additionalProperties": false,
             "description": "Settings for correcting non-overlapping tiles and filtering outliers.",
             "properties": {
               "correction_method": {
