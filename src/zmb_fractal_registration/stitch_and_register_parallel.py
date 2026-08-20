@@ -26,6 +26,8 @@
 #   thanks to grid snapping (see grid_snap.py), but the order-0 registration
 #   reference fusions (_fuse_masked) can still carry 1-px NaN seams at chunk
 #   borders, which marginally weakens registration.
+# - think about writing also intersection and intersection_bbox ROI tables and
+#   possibly also masks
 
 import logging
 from pathlib import Path
@@ -406,7 +408,14 @@ def _write_fused_image(
     out_image = output_container.get_image()
     out_image.set_array(patch=sim_fused_all.data, axes_order=sim_fused_all.dims)
     out_image.consolidate()
-    logger.info("Output image written and consolidated successfully.")
+    # A well ROI table spanning the full fused image, so downstream ROI-based
+    # tasks (segmentation, measurements, ...) can operate on the well.
+    output_container.add_table(
+        "well_ROI_table",
+        output_container.build_image_roi_table(name="well_1"),
+        overwrite=True,
+    )
+    logger.info("Output image and well ROI table written successfully.")
 
 
 @validate_call
