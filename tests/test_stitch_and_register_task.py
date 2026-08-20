@@ -212,6 +212,14 @@ def test_stitch_and_register(tmp_path: Path):
     assert set(plate.acquisition_ids) == {0, 1}
     assert len(plate.images_paths()) == 2
 
+    # The fused image carries a well ROI table spanning its full extent.
+    fused_plate = open_ome_zarr_plate(plate_path.parent / "test_fused.zarr")
+    fused_container = next(iter(fused_plate.get_images(acquisition=0).values()))
+    rois = fused_container.get_table("well_ROI_table").rois()
+    assert len(rois) == 1
+    x_extent_px = rois[0].get("x").length / fused_image.pixel_size.x
+    assert round(x_extent_px) == fused_image.shape[-1]
+
 
 def _create_plate_with_far_tiles(
     plate_path: Path,
