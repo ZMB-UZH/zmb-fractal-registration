@@ -461,6 +461,27 @@ def stitch_and_register_parallel(
                 f"Timeseries data is not supported."
             )
 
+    # 3D registration is not defined on a single z-plane, and multiview-stitcher
+    # fails on the zero-thickness tile boxes it produces (NaNs in the overlap
+    # computation), so such data must be registered in 2D.
+    if not z_project:
+        single_plane_cycles = []
+        for cycle in cycles:
+            image = containers[cycle].get_image()
+            shape = dict(zip(image.axes, image.shape, strict=True))
+            if shape.get("z") == 1:
+                single_plane_cycles.append(cycle)
+        if single_plane_cycles:
+            logger.warning(
+                f"Cycle(s) {single_plane_cycles} contain only a single z-plane; "
+                "registration on single-plane data is only possible in 2D. "
+                "Ignoring z_project=False and computing the registration on a "
+                "z-projection instead (for single-plane cycles this is the "
+                "plane itself); the resulting transforms are applied to the "
+                "full data as usual."
+            )
+            z_project = True
+
     reg_image_ref = containers[ref_cycle].get_image(path=str(init_args.pyramid_level))
     reg_channel = _resolve_registration_channel(
         reg_image_ref, init_args.reference_channel
